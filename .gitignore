@@ -1,0 +1,11 @@
+checkpoints
+LIBERO
+openpi
+wandb
+
+scripts
+.venv
+
+logs/
+__pycache__/
+videos/

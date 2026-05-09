@@ -53,12 +53,11 @@ PROPRIO_DIM = 8
 
 BATCH_SIZE    = 64    # reduced from 128: LoRA backprop through prefix needs more memory
 LR            = 3e-4
-MIN_LR        = 1e-5   # cosine floor: avoids driving LR→0 which destabilises AdamW
 
 LORA_RANK  = 8
 LORA_ALPHA = 16
 WEIGHT_DECAY  = 1e-4
-WARMUP_STEPS  = 4000
+WARMUP_STEPS  = 2000
 MAX_STEPS     = 100000
 LOG_STEPS    = 100
 SAVE_STEPS   = 1000
@@ -388,10 +387,11 @@ def _load_model() -> PI0WithGoalExpert:
     print("Loading PI0WithGoalExpert ...")
     train_cfg = _config.get_config("pi05_libero")
     model = PI0WithGoalExpert(
-        config      = train_cfg.model,
-        patch_dim   = PATCH_DIM,
-        proprio_dim = PROPRIO_DIM,
-        freeze_pi0  = True,
+        config         = train_cfg.model,
+        patch_dim      = PATCH_DIM,
+        proprio_dim    = PROPRIO_DIM,
+        freeze_pi0     = True,
+        expert_variant = "gemma_300m",
     )
     # 1. Load PI0 base weights first (before LoRA renames keys)
     safetensors.torch.load_model(
@@ -471,14 +471,11 @@ def train():
 
     optimizer = torch.optim.AdamW(trainable, lr=LR, weight_decay=WEIGHT_DECAY)
 
-    min_lr_mult = MIN_LR / LR
-
     def lr_lambda(step):
         if step < WARMUP_STEPS:
             return step / WARMUP_STEPS
         progress = (step - WARMUP_STEPS) / max(1, MAX_STEPS - WARMUP_STEPS)
-        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-        return min_lr_mult + (1.0 - min_lr_mult) * cosine
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 

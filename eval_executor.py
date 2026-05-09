@@ -75,6 +75,7 @@ def load_goal_expert() -> PI0WithGoalExpert:
     model = PI0WithGoalExpert(
         config=train_cfg.model, patch_dim=PATCH_DIM,
         proprio_dim=PROPRIO_DIM, freeze_pi0=True,
+        expert_variant="gemma_300m",
     ).to(DEVICE)
 
     # 1. Load PI0 base weights (before LoRA renames keys)
@@ -245,7 +246,7 @@ def eval_generated(executor: Executor, goal_expert: PI0WithGoalExpert,
             wrist= _img_to_chw(ep["wrist_imgs"][sl]).to(DEVICE)
             curr_z = torch.from_numpy(z[sl]).to(DEVICE)           # (B, 4096)
 
-            sg_m, sg_w, sg_s = goal_expert.sample_goal(
+            sg_m, sg_w, sg_s, _ = goal_expert.sample_goal(
                 imgs,
                 wrist,
                 lang_tok.expand(B, -1).to(DEVICE),
@@ -319,7 +320,7 @@ def eval_gen_img_gt_state(executor: Executor, goal_expert: PI0WithGoalExpert,
             B  = min(GOAL_BATCH, N - i)
             imgs  = _img_to_chw(ep["main_imgs"][sl]).to(DEVICE)
             wrist = _img_to_chw(ep["wrist_imgs"][sl]).to(DEVICE)
-            sg_m, sg_w, _ = goal_expert.sample_goal(
+            sg_m, sg_w, _, _ = goal_expert.sample_goal(
                 imgs, wrist,
                 lang_tok.expand(B, -1).to(DEVICE),
                 lang_mask.expand(B, -1).to(DEVICE),
@@ -385,7 +386,7 @@ def eval_gt_img_gen_state(executor: Executor, goal_expert: PI0WithGoalExpert,
             B  = min(GOAL_BATCH, N - i)
             imgs  = _img_to_chw(ep["main_imgs"][sl]).to(DEVICE)
             wrist = _img_to_chw(ep["wrist_imgs"][sl]).to(DEVICE)
-            _, _, sg_s = goal_expert.sample_goal(
+            _, _, sg_s, _ = goal_expert.sample_goal(
                 imgs, wrist,
                 lang_tok.expand(B, -1).to(DEVICE),
                 lang_mask.expand(B, -1).to(DEVICE),

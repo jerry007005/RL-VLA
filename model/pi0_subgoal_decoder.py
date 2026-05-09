@@ -120,9 +120,21 @@ class PI0WithGoalExpert(PI0Pytorch):
         self.sg_wrist_in_proj = nn.Linear(patch_dim,   W, dtype=torch.bfloat16)
         self.sg_state_in_proj = nn.Linear(proprio_dim, W, dtype=torch.bfloat16)
 
-        # Output projections (expert hidden → original dims, tokens 2/3/4 only)
-        self.sg_main_out_proj  = nn.Linear(W, patch_dim,   dtype=torch.bfloat16)
-        self.sg_wrist_out_proj = nn.Linear(W, patch_dim,   dtype=torch.bfloat16)
+        # Output projections (expert hidden → original dims, tokens 2/3/4 only).
+        # Visual heads use a 2-layer MLP with SiLU to break the rank bottleneck
+        # when W < patch_dim (e.g. gemma_300m: W=1024 < patch_dim=2048).
+        # A single Linear(W→patch_dim) has rank≤W, causing an MSE floor of W/patch_dim.
+        # The nonlinearity allows the second layer to span the full patch_dim space.
+        self.sg_main_out_proj  = nn.Sequential(
+            nn.Linear(W, patch_dim,   dtype=torch.bfloat16),
+            nn.SiLU(),
+            nn.Linear(patch_dim, patch_dim, dtype=torch.bfloat16),
+        )
+        self.sg_wrist_out_proj = nn.Sequential(
+            nn.Linear(W, patch_dim,   dtype=torch.bfloat16),
+            nn.SiLU(),
+            nn.Linear(patch_dim, patch_dim, dtype=torch.bfloat16),
+        )
         self.sg_state_out_proj = nn.Linear(W, proprio_dim, dtype=torch.bfloat16)
 
         # Horizon head: predicts (sg_idx - curr_idx) / MAX_HORIZON from token 0.
@@ -141,7 +153,7 @@ class PI0WithGoalExpert(PI0Pytorch):
 
     def _sample_time(self, B, device):
         t = sample_beta(1.5, 1.0, B, device)
-        return (t * 0.999 + 0.001).to(dtype=torch.float32, device=device)
+        return (t * 0.95 + 0.05).to(dtype=torch.float32, device=device)
 
     # ------------------------------------------------------------------
     # Prefix: current obs → KV cache

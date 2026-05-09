@@ -91,6 +91,7 @@ def _load_goal_expert(goal_ckpt: str, pi05_ckpt_dir: str) -> PI0WithGoalExpert:
     model = PI0WithGoalExpert(
         config=train_cfg.model, patch_dim=PATCH_DIM,
         proprio_dim=PROPRIO_DIM, freeze_pi0=True,
+        expert_variant="gemma_300m",
     ).to(DEVICE)
     # 1. Load PI0 base weights (before LoRA renames keys)
     safetensors.torch.load_model(

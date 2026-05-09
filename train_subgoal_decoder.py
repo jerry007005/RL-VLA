@@ -53,11 +53,12 @@ PROPRIO_DIM = 8
 
 BATCH_SIZE    = 64    # reduced from 128: LoRA backprop through prefix needs more memory
 LR            = 3e-4
+MIN_LR        = 1e-5   # cosine floor: avoids driving LR→0 which destabilises AdamW
 
 LORA_RANK  = 8
 LORA_ALPHA = 16
 WEIGHT_DECAY  = 1e-4
-WARMUP_STEPS  = 2000
+WARMUP_STEPS  = 4000
 MAX_STEPS     = 100000
 LOG_STEPS    = 100
 SAVE_STEPS   = 1000
@@ -351,6 +352,7 @@ class GoalExpertDataset(IterableDataset):
                     torch.from_numpy(z_sg[:PATCH_DIM].copy()),          # (2048,) sg_main
                     torch.from_numpy(z_sg[PATCH_DIM:].copy()),          # (2048,) sg_wrist
                     torch.from_numpy(ep["states"][sg_idx].copy()),      # (8,)
+                    torch.tensor(sg_idx - step_idx, dtype=torch.float32),  # () horizon
                 )
 
 
@@ -469,11 +471,14 @@ def train():
 
     optimizer = torch.optim.AdamW(trainable, lr=LR, weight_decay=WEIGHT_DECAY)
 
+    min_lr_mult = MIN_LR / LR
+
     def lr_lambda(step):
         if step < WARMUP_STEPS:
             return step / WARMUP_STEPS
         progress = (step - WARMUP_STEPS) / max(1, MAX_STEPS - WARMUP_STEPS)
-        return 0.5 * (1.0 + math.cos(math.pi * progress))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_lr_mult + (1.0 - min_lr_mult) * cosine
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
@@ -508,13 +513,14 @@ def train():
     for step in pbar:
         batch = next(data_iter)
         main_img, wrist_img, lang_tokens, lang_mask, \
-            curr_main, curr_wrist, sg_main, sg_wrist, sg_state = [
+            curr_main, curr_wrist, sg_main, sg_wrist, sg_state, horizon = [
             x.to(device) for x in batch
         ]
 
         optimizer.zero_grad()
         loss, info = model(main_img, wrist_img, lang_tokens, lang_mask,
-                           curr_main, curr_wrist, sg_main, sg_wrist, sg_state)
+                           curr_main, curr_wrist, sg_main, sg_wrist, sg_state,
+                           horizon=horizon)
         loss.backward()
         nn.utils.clip_grad_norm_(trainable, 1.0)
         optimizer.step()
@@ -527,6 +533,7 @@ def train():
                 main=f"{info['loss/sg_main']:.4f}",
                 wrist=f"{info['loss/sg_wrist']:.4f}",
                 state=f"{info['loss/sg_state']:.4f}",
+                hor=f"{info['loss/horizon']:.4f}",
                 lr=f"{lr:.2e}",
             )
 
@@ -537,15 +544,17 @@ def train():
                     f"main={info['loss/sg_main']:.4f} "
                     f"wrist={info['loss/sg_wrist']:.4f} "
                     f"state={info['loss/sg_state']:.4f} "
+                    f"hor={info['loss/horizon']:.4f} "
                     f"lr={lr:.2e}"
                 )
                 wandb.log(
                     {
-                        "train/loss_total": info["loss/total"],
-                        "train/loss_main":  info["loss/sg_main"],
-                        "train/loss_wrist": info["loss/sg_wrist"],
-                        "train/loss_state": info["loss/sg_state"],
-                        "train/lr":         lr,
+                        "train/loss_total":   info["loss/total"],
+                        "train/loss_main":    info["loss/sg_main"],
+                        "train/loss_wrist":   info["loss/sg_wrist"],
+                        "train/loss_state":   info["loss/sg_state"],
+                        "train/loss_horizon": info["loss/horizon"],
+                        "train/lr":           lr,
                     },
                     step=step + 1,
                 )

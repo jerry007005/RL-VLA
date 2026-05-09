@@ -52,7 +52,7 @@ class Args:
     task_suite_name:    str = "libero_spatial"
     num_steps_wait:     int = 10
     num_trials_per_task:int = 50
-    replan_steps:       int = 5      # replan subgoal every N env steps
+    replan_tolerance:   int = 10     # extra steps added to horizon_pred before replanning
     resize_size:        int = 224
     max_lang_len:       int = 48
     seed:               int = 7
@@ -235,6 +235,7 @@ def eval_libero(args: Args) -> None:
     log_file.write(f"Task suite: {args.task_suite_name}\n")
 
     total_episodes, total_successes = 0, 0
+    total_replans_all, total_replans_success = 0, 0
 
     for task_id in tqdm.tqdm(range(task_suite.n_tasks)):
         task = task_suite.get_task(task_id)
@@ -247,6 +248,7 @@ def eval_libero(args: Args) -> None:
         lang_mask   = torch.from_numpy(lang_mask.astype(bool)).unsqueeze(0).to(DEVICE)
 
         task_episodes, task_successes = 0, 0
+        task_replans_all, task_replans_success = 0, 0
 
         for episode_idx in tqdm.tqdm(range(args.num_trials_per_task)):
             print(f"\nTask: {task_description}")
@@ -257,7 +259,9 @@ def eval_libero(args: Args) -> None:
 
             t = 0
             done = False
-            step_since_replan = args.replan_steps  # force replan on first real step
+            step_since_replan = 1  # force replan on first real step (any value >= next_replan_in=1)
+            next_replan_in    = 1
+            ep_replans        = 0
             sg_main = sg_wrist = sg_state = None   # current subgoal
             frames = []                            # for video recording
 
@@ -290,12 +294,16 @@ def eval_libero(args: Args) -> None:
                         curr_z = torch.cat([curr_main, curr_wrist], dim=-1)  # (1, 4096)
 
                     # Replan subgoal if needed
-                    if step_since_replan >= args.replan_steps:
+                    if step_since_replan >= next_replan_in:
                         with torch.no_grad():
-                            sg_main, sg_wrist, sg_state = goal_expert.sample_goal(
+                            sg_main, sg_wrist, sg_state, horizon_pred = goal_expert.sample_goal(
                                 main_t, wrist_t, lang_tokens, lang_mask, curr_z,
                             )
+                        # Wait horizon_pred + tolerance steps before replanning
+                        h = int(horizon_pred.item()) if horizon_pred is not None else 0
+                        next_replan_in = h + args.replan_tolerance
                         step_since_replan = 0
+                        ep_replans += 1
 
                     # Build Executor input
                     imgs = torch.stack(
@@ -324,6 +332,11 @@ def eval_libero(args: Args) -> None:
 
             task_episodes  += 1
             total_episodes += 1
+            task_replans_all   += ep_replans
+            total_replans_all  += ep_replans
+            if done:
+                task_replans_success  += ep_replans
+                total_replans_success += ep_replans
 
             # Save episode video
             if args.save_video and frames:
@@ -332,21 +345,33 @@ def eval_libero(args: Args) -> None:
                 iio.imwrite(str(vpath), frames, fps=args.video_fps, codec="libx264")
                 print(f"  Video → {vpath.name}")
 
-            print(f"  Success: {done} | total {total_successes}/{total_episodes} "
+            env_steps = t - args.num_steps_wait
+            print(f"  Success: {done} | replans: {ep_replans} / {env_steps} steps "
+                  f"(avg {env_steps/max(ep_replans,1):.1f} steps/subgoal) | "
+                  f"total {total_successes}/{total_episodes} "
                   f"({total_successes/total_episodes*100:.1f}%)")
-            log_file.write(f"Success: {done}\n")
+            log_file.write(f"Success: {done}  replans: {ep_replans}  env_steps: {env_steps}\n")
             log_file.write(f"Episodes: {total_episodes}  Successes: {total_successes} "
                            f"({total_successes/total_episodes*100:.1f}%)\n")
             log_file.flush()
 
         sr = task_successes / task_episodes if task_episodes else 0
-        print(f"Task {task_id} SR: {sr:.3f}")
-        log_file.write(f"Task {task_id} SR: {sr:.3f}\n")
+        avg_all     = task_replans_all     / task_episodes    if task_episodes    else 0
+        avg_success = task_replans_success / task_successes   if task_successes   else float("nan")
+        print(f"Task {task_id} SR: {sr:.3f}  "
+              f"pi0.5 calls — success: {avg_success:.1f}  all: {avg_all:.1f}")
+        log_file.write(f"Task {task_id} SR: {sr:.3f}  "
+                       f"avg_replans_success: {avg_success:.1f}  avg_replans_all: {avg_all:.1f}\n")
         log_file.flush()
 
-    final_sr = total_successes / total_episodes if total_episodes else 0
+    final_sr    = total_successes / total_episodes  if total_episodes  else 0
+    avg_all     = total_replans_all     / total_episodes   if total_episodes   else 0
+    avg_success = total_replans_success / total_successes  if total_successes  else float("nan")
     print(f"\nFinal SR: {final_sr:.3f}  ({total_successes}/{total_episodes})")
+    print(f"pi0.5 calls — success episodes: {avg_success:.1f}/ep  "
+          f"all episodes: {avg_all:.1f}/ep")
     log_file.write(f"\nFinal SR: {final_sr:.3f}  ({total_successes}/{total_episodes})\n")
+    log_file.write(f"pi0.5 calls avg_success: {avg_success:.1f}  avg_all: {avg_all:.1f}\n")
     log_file.close()
 
 

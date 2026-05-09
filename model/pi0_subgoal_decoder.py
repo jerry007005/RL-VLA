@@ -125,6 +125,13 @@ class PI0WithGoalExpert(PI0Pytorch):
         self.sg_wrist_out_proj = nn.Linear(W, patch_dim,   dtype=torch.bfloat16)
         self.sg_state_out_proj = nn.Linear(W, proprio_dim, dtype=torch.bfloat16)
 
+        # Horizon head: predicts (sg_idx - curr_idx) / MAX_HORIZON from token 0.
+        # Token 0 is the curr_main conditioning token — it sees the full prefix
+        # KV + all suffix tokens bidirectionally and is well-placed to regress
+        # the temporal distance to the subgoal.
+        self.MAX_HORIZON   = 200
+        self.horizon_head  = nn.Linear(W, 1, dtype=torch.bfloat16)
+
     # ------------------------------------------------------------------
     # Noise / time helpers
     # ------------------------------------------------------------------
@@ -261,7 +268,12 @@ class PI0WithGoalExpert(PI0Pytorch):
         v_main  = self.sg_main_out_proj(out[:, 2]).float()  + noisy_main.float()  / t_col
         v_wrist = self.sg_wrist_out_proj(out[:, 3]).float() + noisy_wrist.float() / t_col
         v_state = self.sg_state_out_proj(out[:, 4]).float()                    # (B, 8)
-        return v_main, v_wrist, v_state
+
+        # Horizon prediction from token 0 (curr_main conditioning).
+        # Output is normalized steps in (0, MAX_HORIZON); sigmoid keeps it positive.
+        horizon = (torch.sigmoid(self.horizon_head(out[:, 0])).float().squeeze(-1)
+                   * self.MAX_HORIZON)                                         # (B,)
+        return v_main, v_wrist, v_state, horizon
 
     # ------------------------------------------------------------------
     # Training forward
@@ -278,6 +290,7 @@ class PI0WithGoalExpert(PI0Pytorch):
         sg_main:     torch.Tensor,   # (B, 2048) float32  ← encoder latent target
         sg_wrist:    torch.Tensor,   # (B, 2048) float32  ← encoder latent target
         sg_state:    torch.Tensor,   # (B, 8)    float32  ← robot state target
+        horizon:     torch.Tensor | None = None,  # (B,) int  sg_idx - curr_idx
         noise_main:  torch.Tensor | None = None,
         noise_wrist: torch.Tensor | None = None,
         noise_state: torch.Tensor | None = None,
@@ -292,8 +305,6 @@ class PI0WithGoalExpert(PI0Pytorch):
         if time        is None: time        = self._sample_time(B, device)
 
         # Flow matching on delta (sg - curr) for visual tokens; state stays absolute.
-        # Delta is ~170x smaller in magnitude (cos_sim=0.997 at d=50), so the
-        # velocity field is far easier to predict than the absolute target.
         delta_main  = sg_main  - curr_main
         delta_wrist = sg_wrist - curr_wrist
 
@@ -309,7 +320,7 @@ class PI0WithGoalExpert(PI0Pytorch):
             main_img, wrist_img, lang_tokens, lang_mask
         )
 
-        v_main, v_wrist, v_state = self._denoise_step(
+        v_main, v_wrist, v_state, horizon_pred = self._denoise_step(
             noisy_main, noisy_wrist, noisy_state,
             curr_main, curr_wrist,
             time, prefix_kv, prefix_pad
@@ -318,13 +329,23 @@ class PI0WithGoalExpert(PI0Pytorch):
         loss_main  = F.mse_loss(v_main,  u_main)
         loss_wrist = F.mse_loss(v_wrist, u_wrist)
         loss_state = F.mse_loss(v_state, u_state)
-        loss = loss_main + loss_wrist + loss_state
+
+        # Horizon loss: Huber for robustness to outliers (long episodes).
+        # Target normalized to [0, 1] by MAX_HORIZON.
+        if horizon is not None:
+            horizon_norm = horizon.float() / self.MAX_HORIZON
+            loss_horizon = F.huber_loss(horizon_pred / self.MAX_HORIZON, horizon_norm)
+        else:
+            loss_horizon = torch.zeros(1, device=device).squeeze()
+
+        loss = loss_main + loss_wrist + loss_state + loss_horizon
 
         return loss, {
             "loss/total":      loss.item(),
             "loss/sg_main":    loss_main.item(),
             "loss/sg_wrist":   loss_wrist.item(),
             "loss/sg_state":   loss_state.item(),
+            "loss/horizon":    loss_horizon.item(),
         }
 
     def forward(self, main_img, wrist_img, lang_tokens, lang_mask,
@@ -371,8 +392,9 @@ class PI0WithGoalExpert(PI0Pytorch):
         dt = torch.tensor(-1.0 / num_steps, dtype=torch.float32, device=device)
         t  = torch.tensor(1.0,              dtype=torch.float32, device=device)
 
+        horizon_pred = None
         while t >= -dt / 2:
-            v_main, v_wrist, v_state = self._denoise_step(
+            v_main, v_wrist, v_state, horizon_pred = self._denoise_step(
                 x_main, x_wrist, x_state,
                 curr_main, curr_wrist,
                 t.expand(B), prefix_kv, prefix_pad
@@ -382,5 +404,6 @@ class PI0WithGoalExpert(PI0Pytorch):
             x_state = x_state + dt * v_state
             t = t + dt
 
-        # x_main/x_wrist are deltas; recover absolute subgoal by adding curr
-        return curr_main + x_main, curr_wrist + x_wrist, x_state
+        # x_main/x_wrist are deltas; recover absolute subgoal by adding curr.
+        # horizon_pred is in steps (float), from the final denoising step.
+        return curr_main + x_main, curr_wrist + x_wrist, x_state, horizon_pred

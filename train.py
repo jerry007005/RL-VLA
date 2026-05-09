@@ -24,6 +24,7 @@ import wandb
 
 sys.path.insert(0, str(Path(__file__).parent))
 from model.executor import Executor
+from model.subgoal_encoder import SubgoalAutoencoder
 
 # ---------------------------------------------------------------------------
 # Config
@@ -31,12 +32,14 @@ from model.executor import Executor
 
 DST_DATA_DIR  = "/mnt/nfs/Users/jerry007005/dataset/annotated_libero_rlds"
 DATASET_NAME  = "libero_spatial_no_noops"
-CACHE_DIR     = "/mnt/nfs/Users/jerry007005/dataset/executor_feat_cache"
-CKPT_DIR      = "./checkpoints/executor"
+CACHE_DIR          = "/mnt/nfs/Users/jerry007005/dataset/executor_feat_cache"
+CKPT_DIR           = "./checkpoints/executor"
+ENCODER_CKPT_PATH  = "./checkpoints/subgoal_encoder/checkpoint.pt"
 
 PI05_CKPT_DIR = "/mnt/nfs/Users/jerry007005/model/openpi/pi05_libero"
 IMG_SIZE      = 224
 PATCH_DIM     = 2048   # pi0.5 SigLIP projection dim
+N_PATCHES     = 512    # 256 main + 256 wrist
 
 PROPRIO_DIM   = 8
 ACTION_DIM    = 7
@@ -50,6 +53,11 @@ WEIGHT_DECAY        = 1e-4
 MAX_STEPS           = 1_000_000
 LOG_STEPS           = 100
 SAVE_STEPS          = 1_000
+
+# Subgoal noise augmentation: adds Gaussian noise to sg_main / sg_wrist embeddings
+# during training so the executor is robust to goal-expert generation errors.
+# Set to 0 to disable. Start with 0.1 and tune based on eval gap.
+SG_NOISE_STD = 0.1
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -82,6 +90,21 @@ def _load_pi05_vision_encoder():
     return encoder
 
 
+def _load_subgoal_encoder() -> SubgoalAutoencoder:
+    """Load frozen SubgoalAutoencoder from Phase-A checkpoint."""
+    ae = SubgoalAutoencoder(
+        patch_dim=PATCH_DIM, n_queries=2, n_patches=N_PATCHES,
+        n_heads=16, enc_layers=2, dec_layers=2, ffn_mult=4,
+    )
+    ckpt = torch.load(ENCODER_CKPT_PATH, map_location=DEVICE, weights_only=False)
+    ae.load_state_dict(ckpt["model"])
+    ae.eval().to(DEVICE)
+    for p in ae.parameters():
+        p.requires_grad_(False)
+    print("  SubgoalAutoencoder loaded and frozen.")
+    return ae
+
+
 def _preprocess_images(imgs_uint8: np.ndarray) -> torch.Tensor:
     """
     imgs_uint8: (N, H, W, 3) uint8
@@ -101,35 +124,63 @@ def _preprocess_images(imgs_uint8: np.ndarray) -> torch.Tensor:
 
 
 @torch.no_grad()
-def _encode_batch(encoder, imgs_uint8: list[np.ndarray]) -> np.ndarray:
-    """Encode a list of uint8 HWC images → (N, 2048) mean-pooled float32."""
-    pixel_values = _preprocess_images(np.stack(imgs_uint8)).to(DEVICE)
-    # embed_image returns (N, 256, 2048)
-    patch_feats = encoder.embed_image(pixel_values).float()
-    pooled = patch_feats.mean(dim=1)  # (N, 2048)
-    return pooled.cpu().numpy()
+def _encode_frame_batch(
+    backbone,
+    subgoal_enc: SubgoalAutoencoder,
+    main_imgs_uint8: list[np.ndarray],
+    wrist_imgs_uint8: list[np.ndarray],
+) -> np.ndarray:
+    """
+    Run frozen backbone + SubgoalAutoencoder on a batch of (main, wrist) frame pairs.
+    Returns (N, 4096) encoder latents z, where:
+      z[:, :2048]  → main  token
+      z[:, 2048:]  → wrist token
+    """
+    main_pixels  = _preprocess_images(np.stack(main_imgs_uint8)).to(DEVICE)
+    wrist_pixels = _preprocess_images(np.stack(wrist_imgs_uint8)).to(DEVICE)
+    main_patches  = backbone.embed_image(main_pixels).float()    # (N, 256, 2048)
+    wrist_patches = backbone.embed_image(wrist_pixels).float()   # (N, 256, 2048)
+    patches = torch.cat([main_patches, wrist_patches], dim=1)    # (N, 512, 2048)
+    z = subgoal_enc.encode(patches)                              # (N, 4096)
+    return z.cpu().numpy()
 
 
 def extract_features():
-    """Extract and cache pi0.5 image features for every step of every episode."""
+    """
+    Extract and cache SubgoalAutoencoder latents for every frame of every episode.
+
+    Cache format per episode npz:
+      z         : (N, 4096)  encoder latent for each frame (main+wrist)
+      states    : (N, 8)
+      actions   : (N, 7)
+      sg_frames : (N,)       index of subgoal frame for each step
+    """
     cache_path = Path(CACHE_DIR)
     cache_path.mkdir(parents=True, exist_ok=True)
     index_file = cache_path / "index.json"
+
+    # Validate existing cache has encoder latents; re-extract if outdated.
     if index_file.exists():
-        print("Feature cache already exists, skipping extraction.")
-        return
+        index = json.loads(index_file.read_text())
+        first = np.load(cache_path / index[0]["file"])
+        if "z" in first:
+            print("Feature cache (encoder latents) already exists, skipping.")
+            return
+        print("Cache outdated (no encoder latents). Re-extracting ...")
+        index_file.unlink()
 
     import tensorflow as tf
     tf.config.set_visible_devices([], "GPU")
 
-    encoder = _load_pi05_vision_encoder()
+    backbone    = _load_pi05_vision_encoder()
+    subgoal_enc = _load_subgoal_encoder()
 
     from convert_rlds_subgoal import AnnotatedLiberoDataset
     builder = AnnotatedLiberoDataset(config=DATASET_NAME, data_dir=DST_DATA_DIR)
     ds = builder.as_dataset(split="train")
 
     index = []
-    ENCODE_BATCH = 32
+    ENCODE_BATCH = 16   # smaller batch to fit full patches in GPU memory
 
     for ep_idx, episode in enumerate(ds):
         steps = list(episode["steps"].as_numpy_iterator())
@@ -141,22 +192,22 @@ def extract_features():
         actions    = np.array([s["action"]               for s in steps], dtype=np.float32)
         sg_frames  = np.array([int(s["subgoal_frame"])   for s in steps], dtype=np.int32)
 
-        def _batch_encode(imgs):
-            out = []
-            for i in range(0, len(imgs), ENCODE_BATCH):
-                out.append(_encode_batch(encoder, imgs[i:i + ENCODE_BATCH]))
-            return np.concatenate(out, axis=0)
-
-        main_feats  = _batch_encode(main_imgs)   # (N, 2048)
-        wrist_feats = _batch_encode(wrist_imgs)  # (N, 2048)
+        z_list = []
+        for i in range(0, n, ENCODE_BATCH):
+            z_batch = _encode_frame_batch(
+                backbone, subgoal_enc,
+                main_imgs[i:i + ENCODE_BATCH],
+                wrist_imgs[i:i + ENCODE_BATCH],
+            )
+            z_list.append(z_batch)
+        z = np.concatenate(z_list, axis=0).astype(np.float32)  # (N, 4096)
 
         ep_file = cache_path / f"ep_{ep_idx:04d}.npz"
         np.savez_compressed(ep_file,
-            main_feats  = main_feats,
-            wrist_feats = wrist_feats,
-            states      = states,
-            actions     = actions,
-            sg_frames   = sg_frames,
+            z         = z,
+            states    = states,
+            actions   = actions,
+            sg_frames = sg_frames,
         )
         index.append({"ep_idx": ep_idx, "n_steps": n, "file": ep_file.name})
 
@@ -176,6 +227,7 @@ class ExecutorDataset(IterableDataset):
     Infinite iterable dataset with shuffle buffer.
     Each item: (imgs (4, 2048), curr_state (8,), sg_state (8,), action (7,))
     imgs layout: [curr_main, curr_wrist, sg_main, sg_wrist]
+      where each slot is a 2048-dim encoder latent token from SubgoalAutoencoder.
     """
 
     def __init__(self, cache_dir: str, shuffle_buffer_size: int = 1_000):
@@ -187,20 +239,21 @@ class ExecutorDataset(IterableDataset):
         for entry in index:
             data = np.load(Path(cache_dir) / entry["file"])
             ep = {
-                "main_feats":  data["main_feats"].astype(np.float32),
-                "wrist_feats": data["wrist_feats"].astype(np.float32),
-                "states":      data["states"].astype(np.float32),
-                "actions":     data["actions"].astype(np.float32),
-                "sg_frames":   data["sg_frames"].astype(np.int32),
+                "z":         data["z"].astype(np.float32),        # (N, 4096)
+                "states":    data["states"].astype(np.float32),
+                "actions":   data["actions"].astype(np.float32),
+                "sg_frames": data["sg_frames"].astype(np.int32),
             }
             for step_idx in range(entry["n_steps"]):
-                sg_idx = int(ep["sg_frames"][step_idx])
+                sg_idx   = int(ep["sg_frames"][step_idx])
+                z_curr   = ep["z"][step_idx]   # (4096,)
+                z_sg     = ep["z"][sg_idx]     # (4096,)
                 imgs = np.stack([
-                    ep["main_feats"][step_idx],
-                    ep["wrist_feats"][step_idx],
-                    ep["main_feats"][sg_idx],
-                    ep["wrist_feats"][sg_idx],
-                ], axis=0)
+                    z_curr[:PATCH_DIM],   # curr_main  encoder token
+                    z_curr[PATCH_DIM:],   # curr_wrist encoder token
+                    z_sg[:PATCH_DIM],     # sg_main    encoder token
+                    z_sg[PATCH_DIM:],     # sg_wrist   encoder token
+                ], axis=0)               # (4, 2048)
                 self.samples.append((
                     torch.from_numpy(imgs),
                     torch.from_numpy(ep["states"][step_idx]),
@@ -292,6 +345,10 @@ def train():
         curr_state = curr_state.to(DEVICE)
         sg_state   = sg_state.to(DEVICE)
         actions    = actions.to(DEVICE)
+
+        if SG_NOISE_STD > 0:
+            imgs[:, 2] = imgs[:, 2] + torch.randn_like(imgs[:, 2]) * SG_NOISE_STD
+            imgs[:, 3] = imgs[:, 3] + torch.randn_like(imgs[:, 3]) * SG_NOISE_STD
 
         optimizer.zero_grad()
         loss, info = model.compute_bc_loss(imgs, curr_state, sg_state, actions)

@@ -2,8 +2,12 @@
 Subgoal-conditioned Actor Network.
 
 Inputs (all pre-encoded / numpy features — no vision encoder inside):
-  imgs           : (B, 4, patch_dim)  mean-pooled features for
-                   [curr_main, curr_wrist, sg_main, sg_wrist]
+  imgs           : (B, 4, patch_dim)  encoder latent features laid out as:
+                     [0] curr_main   — SubgoalAutoencoder latent z_curr[:, :patch_dim]
+                     [1] curr_wrist  — SubgoalAutoencoder latent z_curr[:, patch_dim:]
+                     [2] sg_main     — SubgoalAutoencoder latent z_sg[:, :patch_dim]
+                     [3] sg_wrist    — SubgoalAutoencoder latent z_sg[:, patch_dim:]
+                   All 4 slots come from SubgoalAutoencoder.encode(concat(main, wrist patches)).
   current_proprio: (B, proprio_dim)   current EEF state
   subgoal_proprio: (B, proprio_dim)   subgoal EEF state
 

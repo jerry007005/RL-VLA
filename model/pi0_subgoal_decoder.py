@@ -2,7 +2,7 @@
 PI0WithGoalExpert
 =================
 Inherits PI0Pytorch and adds a flow-matching goal expert that generates
-mean-pooled subgoal features directly compatible with the Executor.
+subgoal features directly compatible with the Executor.
 
 Architecture
 ------------
@@ -14,14 +14,16 @@ Architecture
       frozen PaliGemma LM → prefix KV cache
 
   Trainable goal expert (GemmaForCausalLM, gemma_300m, bfloat16)
-    Suffix: 3 tokens, fully bidirectional
-      token 0: sg_main_in_proj( noisy_sg_main  )   (B, W)
-      token 1: sg_wrist_in_proj( noisy_sg_wrist )  (B, W)
-      token 2: sg_state_in_proj( noisy_sg_state )  (B, W)
+    Suffix: 5 tokens, fully bidirectional
+      token 0: curr_main_in_proj( z_curr[:2048] )   (B, W)  ← current obs conditioning
+      token 1: curr_wrist_in_proj( z_curr[2048:] )  (B, W)  ← current obs conditioning
+      token 2: sg_main_in_proj( noisy_sg_main  )    (B, W)
+      token 3: sg_wrist_in_proj( noisy_sg_wrist )   (B, W)
+      token 4: sg_state_in_proj( noisy_sg_state )   (B, W)
     Timestep → AdaRMS conditioning
-    All 3 tokens attend to each other + full prefix KV
+    All 5 tokens attend to each other + full prefix KV
 
-  Output heads
+  Output heads (applied only to tokens 2, 3, 4)
     sg_main_out_proj  : (B, W) → (B, 2048)
     sg_wrist_out_proj : (B, W) → (B, 2048)
     sg_state_out_proj : (B, W) → (B, 8)
@@ -31,7 +33,7 @@ Training: flow matching (same as PI0)
   predict u = noise - target
   loss = MSE over (sg_main, sg_wrist, sg_state)
 
-Inference: sample_goal() → (sg_main_emb, sg_wrist_emb, sg_state) float32
+Inference: sample_goal(curr_z) → (sg_main_emb, sg_wrist_emb, sg_state) float32
   Directly stackable as Executor's imgs (B, 4, 2048) + subgoal_proprio (B, 8)
 """
 
@@ -61,7 +63,7 @@ class PI0WithGoalExpert(PI0Pytorch):
     """
     PI0 + flow-matching goal expert.
 
-    sample_goal() returns (sg_main_emb, sg_wrist_emb, sg_state) that plug
+    sample_goal(curr_z) returns (sg_main_emb, sg_wrist_emb, sg_state) that plug
     directly into the Executor:
         imgs = torch.stack([curr_main, curr_wrist, sg_main_emb, sg_wrist_emb], dim=1)
         subgoal_proprio = sg_state
@@ -73,7 +75,7 @@ class PI0WithGoalExpert(PI0Pytorch):
         patch_dim:    int  = 2048,
         proprio_dim:  int  = 8,
         freeze_pi0:   bool = True,
-        expert_variant: str = "gemma_300m",
+        expert_variant: str = "gemma_2b",
     ):
         super().__init__(config=config)
 
@@ -109,12 +111,16 @@ class PI0WithGoalExpert(PI0Pytorch):
         self.goal_time_mlp_in  = nn.Linear(W, W, dtype=torch.bfloat16)
         self.goal_time_mlp_out = nn.Linear(W, W, dtype=torch.bfloat16)
 
-        # Input projections  (noisy targets → expert width)
+        # Current obs conditioning projections (z_curr → expert width)
+        self.curr_main_in_proj  = nn.Linear(patch_dim, W, dtype=torch.bfloat16)
+        self.curr_wrist_in_proj = nn.Linear(patch_dim, W, dtype=torch.bfloat16)
+
+        # Noisy target input projections
         self.sg_main_in_proj  = nn.Linear(patch_dim,   W, dtype=torch.bfloat16)
         self.sg_wrist_in_proj = nn.Linear(patch_dim,   W, dtype=torch.bfloat16)
         self.sg_state_in_proj = nn.Linear(proprio_dim, W, dtype=torch.bfloat16)
 
-        # Output projections (expert hidden → original dims)
+        # Output projections (expert hidden → original dims, tokens 2/3/4 only)
         self.sg_main_out_proj  = nn.Linear(W, patch_dim,   dtype=torch.bfloat16)
         self.sg_wrist_out_proj = nn.Linear(W, patch_dim,   dtype=torch.bfloat16)
         self.sg_state_out_proj = nn.Linear(W, proprio_dim, dtype=torch.bfloat16)
@@ -151,7 +157,6 @@ class PI0WithGoalExpert(PI0Pytorch):
 
         embs      = torch.cat(embs, dim=1)          # (B, 560, 2048)
         pad_masks = torch.cat(pad_masks, dim=1)     # (B, 560)
-        # all-zero att_masks → fully bidirectional prefix attention
         att_masks = torch.zeros(B, embs.shape[1], dtype=torch.float32, device=embs.device)
         return embs, pad_masks, att_masks
 
@@ -173,7 +178,7 @@ class PI0WithGoalExpert(PI0Pytorch):
         return kv, prefix_pad
 
     # ------------------------------------------------------------------
-    # Goal suffix: 3 noisy tokens → suffix embeddings
+    # Goal suffix: 2 conditioning + 3 noisy tokens → suffix embeddings
     # ------------------------------------------------------------------
 
     def _embed_goal_suffix(
@@ -181,24 +186,34 @@ class PI0WithGoalExpert(PI0Pytorch):
         noisy_main:  torch.Tensor,   # (B, 2048) float32
         noisy_wrist: torch.Tensor,   # (B, 2048) float32
         noisy_state: torch.Tensor,   # (B, 8)    float32
+        curr_main:   torch.Tensor,   # (B, 2048) float32  ← z_curr[:, :2048]
+        curr_wrist:  torch.Tensor,   # (B, 2048) float32  ← z_curr[:, 2048:]
         time:        torch.Tensor,   # (B,)      float32
     ):
         B      = noisy_main.shape[0]
         device = noisy_main.device
 
+        # Conditioning tokens (current obs, not denoised)
+        tok_curr_main  = self.curr_main_in_proj(curr_main.to(torch.bfloat16))    # (B, W)
+        tok_curr_wrist = self.curr_wrist_in_proj(curr_wrist.to(torch.bfloat16))  # (B, W)
+
+        # Noisy target tokens
         tok_main  = self.sg_main_in_proj(noisy_main.to(torch.bfloat16))   # (B, W)
         tok_wrist = self.sg_wrist_in_proj(noisy_wrist.to(torch.bfloat16)) # (B, W)
         tok_state = self.sg_state_in_proj(noisy_state.to(torch.bfloat16)) # (B, W)
-        suffix_embs = torch.stack([tok_main, tok_wrist, tok_state], dim=1) # (B, 3, W)
+
+        # [curr_main, curr_wrist, sg_main, sg_wrist, sg_state]
+        suffix_embs = torch.stack(
+            [tok_curr_main, tok_curr_wrist, tok_main, tok_wrist, tok_state], dim=1
+        )  # (B, 5, W)
 
         time_emb = create_sinusoidal_pos_embedding(
             time, self._W, min_period=4e-3, max_period=4.0, device=device
         ).to(torch.bfloat16)
         adarms_cond = F.silu(self.goal_time_mlp_out(self.goal_time_mlp_in(time_emb)))  # (B, W)
 
-        # all-zero att_masks → 3 tokens attend to each other fully (bidirectional)
-        pad_masks = torch.ones(B, 3,  dtype=torch.bool,    device=device)
-        att_masks = torch.zeros(B, 3, dtype=torch.float32, device=device)
+        pad_masks = torch.ones(B, 5,  dtype=torch.bool,    device=device)
+        att_masks = torch.zeros(B, 5, dtype=torch.float32, device=device)
         return suffix_embs, pad_masks, att_masks, adarms_cond
 
     # ------------------------------------------------------------------
@@ -210,18 +225,20 @@ class PI0WithGoalExpert(PI0Pytorch):
         noisy_main:  torch.Tensor,
         noisy_wrist: torch.Tensor,
         noisy_state: torch.Tensor,
+        curr_main:   torch.Tensor,
+        curr_wrist:  torch.Tensor,
         time:        torch.Tensor,
         prefix_kv,
         prefix_pad:  torch.Tensor,
     ):
         suffix_embs, suffix_pad, suffix_att, adarms_cond = self._embed_goal_suffix(
-            noisy_main, noisy_wrist, noisy_state, time
+            noisy_main, noisy_wrist, noisy_state, curr_main, curr_wrist, time
         )
         B, prefix_len = prefix_pad.shape
 
-        prefix_pad_2d = prefix_pad[:, None, :].expand(B, 3, prefix_len)
+        prefix_pad_2d = prefix_pad[:, None, :].expand(B, 5, prefix_len)
         suffix_att_2d = make_att_2d_masks(suffix_pad, suffix_att)
-        full_att_2d   = torch.cat([prefix_pad_2d, suffix_att_2d], dim=2)  # (B, 3, prefix+3)
+        full_att_2d   = torch.cat([prefix_pad_2d, suffix_att_2d], dim=2)  # (B, 5, prefix+5)
         full_att_4d   = self._prepare_attention_masks_4d(full_att_2d).to(torch.bfloat16)
 
         prefix_offsets = prefix_pad.sum(dim=-1)[:, None]
@@ -234,11 +251,16 @@ class PI0WithGoalExpert(PI0Pytorch):
             past_key_values = prefix_kv,
             use_cache       = False,
             adarms_cond     = adarms_cond,
-        ).last_hidden_state  # (B, 3, W) bfloat16
+        ).last_hidden_state  # (B, 5, W) bfloat16
 
-        v_main  = self.sg_main_out_proj(out[:, 0]).float()   # (B, 2048)
-        v_wrist = self.sg_wrist_out_proj(out[:, 1]).float()  # (B, 2048)
-        v_state = self.sg_state_out_proj(out[:, 2]).float()  # (B, 8)
+        # Project only the 3 noisy tokens (indices 2, 3, 4).
+        # Visual tokens use residual parameterization: model predicts the correction
+        # over noisy/t, so the target becomes -delta/t instead of noise-delta.
+        # This bypasses the rank bottleneck for the dominant noise component.
+        t_col   = time[:, None].float()                                        # (B, 1)
+        v_main  = self.sg_main_out_proj(out[:, 2]).float()  + noisy_main.float()  / t_col
+        v_wrist = self.sg_wrist_out_proj(out[:, 3]).float() + noisy_wrist.float() / t_col
+        v_state = self.sg_state_out_proj(out[:, 4]).float()                    # (B, 8)
         return v_main, v_wrist, v_state
 
     # ------------------------------------------------------------------
@@ -251,8 +273,10 @@ class PI0WithGoalExpert(PI0Pytorch):
         wrist_img:   torch.Tensor,   # (B, 3, H, W) float32
         lang_tokens: torch.Tensor,   # (B, T) int64
         lang_mask:   torch.Tensor,   # (B, T) bool
-        sg_main:     torch.Tensor,   # (B, 2048) float32  ← mean-pooled SigLIP target
-        sg_wrist:    torch.Tensor,   # (B, 2048) float32  ← mean-pooled SigLIP target
+        curr_main:   torch.Tensor,   # (B, 2048) float32  ← z_curr[:, :2048]
+        curr_wrist:  torch.Tensor,   # (B, 2048) float32  ← z_curr[:, 2048:]
+        sg_main:     torch.Tensor,   # (B, 2048) float32  ← encoder latent target
+        sg_wrist:    torch.Tensor,   # (B, 2048) float32  ← encoder latent target
         sg_state:    torch.Tensor,   # (B, 8)    float32  ← robot state target
         noise_main:  torch.Tensor | None = None,
         noise_wrist: torch.Tensor | None = None,
@@ -267,21 +291,28 @@ class PI0WithGoalExpert(PI0Pytorch):
         if noise_state is None: noise_state = self._sample_noise(sg_state.shape, device)
         if time        is None: time        = self._sample_time(B, device)
 
+        # Flow matching on delta (sg - curr) for visual tokens; state stays absolute.
+        # Delta is ~170x smaller in magnitude (cos_sim=0.997 at d=50), so the
+        # velocity field is far easier to predict than the absolute target.
+        delta_main  = sg_main  - curr_main
+        delta_wrist = sg_wrist - curr_wrist
+
         t = time[:, None]
-        noisy_main  = t * noise_main  + (1 - t) * sg_main
-        noisy_wrist = t * noise_wrist + (1 - t) * sg_wrist
+        noisy_main  = t * noise_main  + (1 - t) * delta_main
+        noisy_wrist = t * noise_wrist + (1 - t) * delta_wrist
         noisy_state = t * noise_state + (1 - t) * sg_state
-        u_main  = noise_main  - sg_main
-        u_wrist = noise_wrist - sg_wrist
+        u_main  = noise_main  - delta_main
+        u_wrist = noise_wrist - delta_wrist
         u_state = noise_state - sg_state
 
-        with torch.no_grad():
-            prefix_kv, prefix_pad = self._prefix_kv_cache(
-                main_img, wrist_img, lang_tokens, lang_mask
-            )
+        prefix_kv, prefix_pad = self._prefix_kv_cache(
+            main_img, wrist_img, lang_tokens, lang_mask
+        )
 
         v_main, v_wrist, v_state = self._denoise_step(
-            noisy_main, noisy_wrist, noisy_state, time, prefix_kv, prefix_pad
+            noisy_main, noisy_wrist, noisy_state,
+            curr_main, curr_wrist,
+            time, prefix_kv, prefix_pad
         )
 
         loss_main  = F.mse_loss(v_main,  u_main)
@@ -297,10 +328,10 @@ class PI0WithGoalExpert(PI0Pytorch):
         }
 
     def forward(self, main_img, wrist_img, lang_tokens, lang_mask,
-                sg_main, sg_wrist, sg_state, **kwargs):
+                curr_main, curr_wrist, sg_main, sg_wrist, sg_state, **kwargs):
         """Standard forward for DDP compatibility — delegates to forward_goal."""
         return self.forward_goal(main_img, wrist_img, lang_tokens, lang_mask,
-                                 sg_main, sg_wrist, sg_state, **kwargs)
+                                 curr_main, curr_wrist, sg_main, sg_wrist, sg_state, **kwargs)
 
     # ------------------------------------------------------------------
     # Inference: Euler sampler
@@ -313,6 +344,7 @@ class PI0WithGoalExpert(PI0Pytorch):
         wrist_img:   torch.Tensor,   # (B, 3, H, W) float32
         lang_tokens: torch.Tensor,   # (B, T) int64
         lang_mask:   torch.Tensor,   # (B, T) bool
+        curr_z:      torch.Tensor,   # (B, 4096) float32  ← encoder latent of current frame
         num_steps:   int = 10,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -324,6 +356,9 @@ class PI0WithGoalExpert(PI0Pytorch):
         """
         B      = main_img.shape[0]
         device = main_img.device
+
+        curr_main  = curr_z[:, :self.patch_dim].float()
+        curr_wrist = curr_z[:, self.patch_dim:].float()
 
         prefix_kv, prefix_pad = self._prefix_kv_cache(
             main_img, wrist_img, lang_tokens, lang_mask
@@ -338,11 +373,14 @@ class PI0WithGoalExpert(PI0Pytorch):
 
         while t >= -dt / 2:
             v_main, v_wrist, v_state = self._denoise_step(
-                x_main, x_wrist, x_state, t.expand(B), prefix_kv, prefix_pad
+                x_main, x_wrist, x_state,
+                curr_main, curr_wrist,
+                t.expand(B), prefix_kv, prefix_pad
             )
             x_main  = x_main  + dt * v_main
             x_wrist = x_wrist + dt * v_wrist
             x_state = x_state + dt * v_state
             t = t + dt
 
-        return x_main, x_wrist, x_state
+        # x_main/x_wrist are deltas; recover absolute subgoal by adding curr
+        return curr_main + x_main, curr_wrist + x_wrist, x_state

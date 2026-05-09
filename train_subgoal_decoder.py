@@ -1,19 +1,14 @@
 """
 Train PI0WithGoalExpert with flow-matching loss.
 
-Phase 0  — one-time cache build
-  Load annotated_libero_rlds, resize images to 224×224 (uint8), tokenize
-  language instructions with PaliGemma SentencePiece tokenizer, save per-
-  episode .npz files to SUBGOAL_CACHE_DIR.
-
-Phase 1  — training
-  Each batch:
-    ① load raw images + lang tokens from Phase 0 cache (lazy per episode)
-    ② load subgoal targets (main_feats, wrist_feats, states at sg_frame)
-       from the existing executor feature cache (already on disk)
+Phase 0   — one-time: resize images + tokenize language → SUBGOAL_CACHE_DIR
+Phase 0.5 — one-time: backbone + SubgoalAutoencoder → encoder latents z → SG_ENCODER_CACHE_DIR
+Phase 1   — training:
+    ① raw images + lang tokens from SUBGOAL_CACHE_DIR (lazy per episode)
+    ② encoder latent z[sg], states[sg] from SG_ENCODER_CACHE_DIR
     ③ frozen PI0 prefix → KV cache
-    ④ noisy [sg_main | sg_wrist | sg_state] tokens → goal expert → flow-matching loss
-    ⑤ back-prop through goal expert weights only
+    ④ noisy [sg_main | sg_wrist | sg_state] → goal expert → flow-matching loss
+    ⑤ back-prop through goal expert only
 
 Run: python train_subgoal_decoder.py
 """
@@ -41,13 +36,14 @@ from model.pi0_subgoal_decoder import PI0WithGoalExpert
 # Config
 # ---------------------------------------------------------------------------
 
-DST_DATA_DIR      = "/mnt/nfs/Users/jerry007005/dataset/annotated_libero_rlds"
-DATASET_NAME      = "libero_spatial_no_noops"
-FEAT_CACHE_DIR    = "/mnt/nfs/Users/jerry007005/dataset/executor_feat_cache"
-SUBGOAL_CACHE_DIR = "/mnt/nfs/Users/jerry007005/dataset/subgoal_decoder_cache"
-CKPT_DIR          = "./checkpoints/subgoal_decoder"
+DST_DATA_DIR         = "/mnt/nfs/Users/jerry007005/dataset/annotated_libero_rlds"
+DATASET_NAME         = "libero_spatial_no_noops"
+SUBGOAL_CACHE_DIR    = "/mnt/nfs/Users/jerry007005/dataset/subgoal_decoder_cache"
+SG_ENCODER_CACHE_DIR = "/mnt/nfs/Users/jerry007005/dataset/sg_encoder_cache"
+CKPT_DIR             = "./checkpoints/subgoal_decoder"
 
-PI05_CKPT_DIR = "/mnt/nfs/Users/jerry007005/model/openpi/pi05_libero"
+PI05_CKPT_DIR     = "/mnt/nfs/Users/jerry007005/model/openpi/pi05_libero"
+ENCODER_CKPT_PATH = "./checkpoints/subgoal_encoder/checkpoint.pt"
 
 IMG_SIZE     = 224
 MAX_LANG_LEN = 48
@@ -55,8 +51,11 @@ MAX_LANG_LEN = 48
 PATCH_DIM   = 2048
 PROPRIO_DIM = 8
 
-BATCH_SIZE    = 128
-LR            = 6e-4  # linear scaling: 3e-4 * (128*2/64), conservative
+BATCH_SIZE    = 64    # reduced from 128: LoRA backprop through prefix needs more memory
+LR            = 3e-4
+
+LORA_RANK  = 8
+LORA_ALPHA = 16
 WEIGHT_DECAY  = 1e-4
 WARMUP_STEPS  = 2000
 MAX_STEPS     = 100000
@@ -67,6 +66,137 @@ WANDB_PROJECT  = "RL-VLA"
 WANDB_RUN_NAME = "goal-expert"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+# ---------------------------------------------------------------------------
+# Phase 0.5 helpers: backbone + encoder for latent pre-computation
+# ---------------------------------------------------------------------------
+
+def _load_pi05_backbone():
+    from openpi.training import config as _cfg
+    from openpi.models_pytorch.pi0_pytorch import PI0Pytorch
+    import safetensors.torch
+
+    print("Loading PI0 backbone ...")
+    cfg   = _cfg.get_config("pi05_libero")
+    model = PI0Pytorch(config=cfg.model)
+    safetensors.torch.load_model(
+        model, os.path.join(PI05_CKPT_DIR, "model.safetensors"), strict=False
+    )
+    backbone = model.paligemma_with_expert
+    backbone.eval().to(DEVICE)
+    for p in backbone.parameters():
+        p.requires_grad_(False)
+    print("  Backbone loaded.")
+    return backbone
+
+
+def _load_subgoal_encoder_for_phase05():
+    from model.subgoal_encoder import SubgoalAutoencoder
+    ae = SubgoalAutoencoder(
+        patch_dim=PATCH_DIM, n_queries=2, n_patches=512,
+        n_heads=16, enc_layers=2, dec_layers=2, ffn_mult=4,
+    )
+    ckpt = torch.load(ENCODER_CKPT_PATH, map_location=DEVICE, weights_only=False)
+    ae.load_state_dict(ckpt["model"])
+    ae.eval().to(DEVICE)
+    for p in ae.parameters():
+        p.requires_grad_(False)
+    print("  SubgoalAutoencoder loaded.")
+    return ae
+
+
+@torch.no_grad()
+def _encode_frames(backbone, encoder, main_imgs_uint8, wrist_imgs_uint8, bs=16):
+    """
+    (N, H, W, 3) uint8 arrays → z (N, 4096) float32 via backbone + encoder.
+    """
+    from openpi_client import image_tools
+
+    def _prep(imgs):
+        out = []
+        for img in imgs:
+            r = image_tools.convert_to_uint8(
+                image_tools.resize_with_pad(img, IMG_SIZE, IMG_SIZE)
+            )
+            t = torch.from_numpy(r).float() / 255.0
+            out.append((t * 2.0 - 1.0).permute(2, 0, 1))
+        return torch.stack(out).to(DEVICE)
+
+    N = len(main_imgs_uint8)
+    z_list = []
+    for i in range(0, N, bs):
+        mp = backbone.embed_image(_prep(main_imgs_uint8[i:i+bs])).float()   # (B,256,2048)
+        wp = backbone.embed_image(_prep(wrist_imgs_uint8[i:i+bs])).float()  # (B,256,2048)
+        patches = torch.cat([mp, wp], dim=1)                                # (B,512,2048)
+        z_list.append(encoder.encode(patches).cpu().numpy())
+    return np.concatenate(z_list, axis=0).astype(np.float32)                # (N,4096)
+
+
+def extract_sg_encoder_latents():
+    """
+    Phase 0.5: compute SubgoalAutoencoder latents for every frame of every episode.
+
+    Reads:
+      subgoal_decoder_cache  — raw images (main_imgs, wrist_imgs)
+      executor_feat_cache    — states, sg_frames  (old format OK)
+
+    Writes to sg_encoder_cache per episode:
+      z         : (N, 4096)  encoder latent (main+wrist)
+      states    : (N, 8)
+      sg_frames : (N,)
+    """
+    # executor_feat_cache (old format) is only needed here to bootstrap
+    # states and sg_frames; not used anywhere else in this script.
+    _FEAT_CACHE = "/mnt/nfs/Users/jerry007005/dataset/executor_feat_cache"
+
+    out_path = Path(SG_ENCODER_CACHE_DIR)
+    out_path.mkdir(parents=True, exist_ok=True)
+    index_file = out_path / "index.json"
+
+    if index_file.exists():
+        print("Phase 0.5 cache already exists, skipping.")
+        return
+
+    sg_path   = Path(SUBGOAL_CACHE_DIR)
+    feat_path = Path(_FEAT_CACHE)
+
+    sg_index   = json.loads((sg_path   / "index.json").read_text())
+    feat_index = json.loads((feat_path / "index.json").read_text())
+    feat_map   = {e["ep_idx"]: e for e in feat_index}
+
+    backbone = _load_pi05_backbone()
+    encoder  = _load_subgoal_encoder_for_phase05()
+
+    out_index = []
+    for ep_entry in sg_index:
+        ep_idx = ep_entry["ep_idx"]
+        if ep_idx not in feat_map:
+            continue
+
+        sg_data   = np.load(sg_path   / ep_entry["file"])
+        feat_data = np.load(feat_path / feat_map[ep_idx]["file"])
+
+        main_imgs  = sg_data["main_imgs"]    # (N, 224, 224, 3)
+        wrist_imgs = sg_data["wrist_imgs"]
+
+        z = _encode_frames(backbone, encoder,
+                           list(main_imgs), list(wrist_imgs))  # (N, 4096)
+
+        ep_file = out_path / f"ep_{ep_idx:04d}.npz"
+        np.savez_compressed(ep_file,
+            z         = z,
+            states    = feat_data["states"].astype(np.float32),
+            sg_frames = feat_data["sg_frames"].astype(np.int32),
+        )
+        out_index.append({"ep_idx": ep_idx, "n_steps": ep_entry["n_steps"],
+                          "file": ep_file.name})
+
+        if ep_idx % 20 == 0:
+            print(f"  ep {ep_idx:4d}: {ep_entry['n_steps']} steps encoded")
+
+    index_file.write_text(json.dumps(out_index, indent=2))
+    print(f"Phase 0.5 done. {len(out_index)} episodes → {SG_ENCODER_CACHE_DIR}")
 
 
 # ---------------------------------------------------------------------------
@@ -144,40 +274,49 @@ def _img_to_chw(img_uint8: np.ndarray) -> torch.Tensor:
 class GoalExpertDataset(IterableDataset):
     """
     Each item:
-      main_chw    : (3, 224, 224) float32  current main image
-      wrist_chw   : (3, 224, 224) float32  current wrist image
+      main_chw    : (3, 224, 224) float32   current main image
+      wrist_chw   : (3, 224, 224) float32   current wrist image
       lang_tokens : (MAX_LANG_LEN,) int64
       lang_mask   : (MAX_LANG_LEN,) bool
-      sg_main     : (PATCH_DIM,)  float32  mean-pooled SigLIP at subgoal frame
-      sg_wrist    : (PATCH_DIM,)  float32  mean-pooled SigLIP wrist at subgoal frame
-      sg_state    : (PROPRIO_DIM,) float32 robot state at subgoal frame
+      curr_main   : (PATCH_DIM,)   float32  encoder latent z[curr, :2048]
+      curr_wrist  : (PATCH_DIM,)   float32  encoder latent z[curr, 2048:]
+      sg_main     : (PATCH_DIM,)   float32  encoder latent z[sg, :2048]
+      sg_wrist    : (PATCH_DIM,)   float32  encoder latent z[sg, 2048:]
+      sg_state    : (PROPRIO_DIM,) float32  robot state at subgoal frame
+
+    Reads raw images + lang from subgoal_cache_dir.
+    Reads encoder latents + states + sg_frames from sg_enc_cache_dir
+    (built by extract_sg_encoder_latents()).
     """
 
-    def __init__(self, subgoal_cache_dir: str, feat_cache_dir: str):
-        sg_path   = Path(subgoal_cache_dir)
-        feat_path = Path(feat_cache_dir)
+    def __init__(self, subgoal_cache_dir: str, sg_enc_cache_dir: str):
+        sg_path  = Path(subgoal_cache_dir)
+        enc_path = Path(sg_enc_cache_dir)
 
-        index = json.loads((feat_path / "index.json").read_text())
+        enc_index = json.loads((enc_path / "index.json").read_text())
+        sg_index  = {
+            e["ep_idx"]: e
+            for e in json.loads((sg_path / "index.json").read_text())
+        }
 
         self.episodes = []
         print("Loading caches ...")
-        for entry in index:
-            ep_idx = entry["ep_idx"]
-
-            feat_data = np.load(feat_path / entry["file"])
-            sg_file   = sg_path / f"ep_{ep_idx:04d}.npz"
-            if not sg_file.exists():
+        for entry in enc_index:
+            ep_idx  = entry["ep_idx"]
+            sg_entry = sg_index.get(ep_idx)
+            if sg_entry is None:
                 continue
-            sg_data = np.load(sg_file)
+
+            enc_data = np.load(enc_path / entry["file"])
+            sg_data  = np.load(sg_path  / sg_entry["file"])
 
             self.episodes.append({
                 "ep_idx":      ep_idx,
                 "n_steps":     entry["n_steps"],
-                "sg_file":     str(sg_file),
-                "main_feats":  feat_data["main_feats"].astype(np.float32),
-                "wrist_feats": feat_data["wrist_feats"].astype(np.float32),
-                "states":      feat_data["states"].astype(np.float32),
-                "sg_frames":   feat_data["sg_frames"].astype(np.int32),
+                "sg_file":     str(sg_path / sg_entry["file"]),
+                "z":           enc_data["z"].astype(np.float32),        # (N, 4096)
+                "states":      enc_data["states"].astype(np.float32),   # (N, 8)
+                "sg_frames":   enc_data["sg_frames"].astype(np.int32),  # (N,)
                 "lang_tokens": torch.from_numpy(sg_data["lang_tokens"].astype(np.int64)),
                 "lang_mask":   torch.from_numpy(sg_data["lang_mask"].astype(bool)),
             })
@@ -199,21 +338,46 @@ class GoalExpertDataset(IterableDataset):
             random.shuffle(step_order)
 
             for step_idx in step_order:
-                sg_idx = int(ep["sg_frames"][step_idx])
+                sg_idx  = int(ep["sg_frames"][step_idx])
+                z_curr  = ep["z"][step_idx]        # (4096,)
+                z_sg    = ep["z"][sg_idx]          # (4096,)
                 yield (
-                    _img_to_chw(main_imgs[step_idx]),                    # (3, H, W)
-                    _img_to_chw(wrist_imgs[step_idx]),                   # (3, H, W)
-                    ep["lang_tokens"],                                    # (T,)
-                    ep["lang_mask"],                                      # (T,)
-                    torch.from_numpy(ep["main_feats"][sg_idx]),           # (2048,)
-                    torch.from_numpy(ep["wrist_feats"][sg_idx]),          # (2048,)
-                    torch.from_numpy(ep["states"][sg_idx]),               # (8,)
+                    _img_to_chw(main_imgs[step_idx]),                   # (3, H, W)
+                    _img_to_chw(wrist_imgs[step_idx]),                  # (3, H, W)
+                    ep["lang_tokens"],                                   # (T,)
+                    ep["lang_mask"],                                     # (T,)
+                    torch.from_numpy(z_curr[:PATCH_DIM].copy()),        # (2048,) curr_main
+                    torch.from_numpy(z_curr[PATCH_DIM:].copy()),        # (2048,) curr_wrist
+                    torch.from_numpy(z_sg[:PATCH_DIM].copy()),          # (2048,) sg_main
+                    torch.from_numpy(z_sg[PATCH_DIM:].copy()),          # (2048,) sg_wrist
+                    torch.from_numpy(ep["states"][sg_idx].copy()),      # (8,)
                 )
 
 
 # ---------------------------------------------------------------------------
 # Load model
 # ---------------------------------------------------------------------------
+
+def _apply_lora(model: PI0WithGoalExpert):
+    """Apply LoRA to PaliGemma language model attention layers after base weights are loaded."""
+    from peft import get_peft_model, LoraConfig
+    lora_cfg = LoraConfig(
+        r              = LORA_RANK,
+        lora_alpha     = LORA_ALPHA,
+        target_modules = ["q_proj", "v_proj"],
+        lora_dropout   = 0.0,   # 0 so eval() on backbone doesn't affect training
+        bias           = "none",
+    )
+    model.paligemma_with_expert.paligemma.language_model = get_peft_model(
+        model.paligemma_with_expert.paligemma.language_model,
+        lora_cfg,
+    )
+    n_lora = sum(
+        p.numel() for p in model.paligemma_with_expert.parameters()
+        if p.requires_grad
+    )
+    print(f"  LoRA applied (r={LORA_RANK}): {n_lora/1e6:.2f}M trainable backbone params")
+
 
 def _load_model() -> PI0WithGoalExpert:
     from openpi.training import config as _config
@@ -227,14 +391,19 @@ def _load_model() -> PI0WithGoalExpert:
         proprio_dim = PROPRIO_DIM,
         freeze_pi0  = True,
     )
-    # Load PI0 backbone weights; goal expert weights stay randomly initialized
+    # 1. Load PI0 base weights first (before LoRA renames keys)
     safetensors.torch.load_model(
         model,
         os.path.join(PI05_CKPT_DIR, "model.safetensors"),
         strict=False,
     )
+    # 2. Apply LoRA (adds trainable A/B matrices, base weights stay frozen)
+    _apply_lora(model)
+    # 3. Gradient checkpointing to offset memory cost of LoRA backprop through prefix
+    model.paligemma_with_expert.paligemma.language_model.gradient_checkpointing_enable()
+    # 4. Compile only the goal expert (LoRA layers are too small to benefit from compile)
     model.goal_expert = torch.compile(model.goal_expert)
-    print("  Model loaded (goal_expert compiled).")
+    print("  Model loaded (LoRA on PaliGemma LM + goal_expert compiled).")
     return model
 
 
@@ -282,7 +451,7 @@ def train():
     # 每个 rank 用不同随机种子，保证数据多样性
     random.seed(42 + rank)
 
-    dataset = GoalExpertDataset(SUBGOAL_CACHE_DIR, FEAT_CACHE_DIR)
+    dataset = GoalExpertDataset(SUBGOAL_CACHE_DIR, SG_ENCODER_CACHE_DIR)
     loader  = DataLoader(dataset, batch_size=BATCH_SIZE, num_workers=2,
                          pin_memory=True, persistent_workers=True)
 
@@ -338,13 +507,14 @@ def train():
 
     for step in pbar:
         batch = next(data_iter)
-        main_img, wrist_img, lang_tokens, lang_mask, sg_main, sg_wrist, sg_state = [
+        main_img, wrist_img, lang_tokens, lang_mask, \
+            curr_main, curr_wrist, sg_main, sg_wrist, sg_state = [
             x.to(device) for x in batch
         ]
 
         optimizer.zero_grad()
         loss, info = model(main_img, wrist_img, lang_tokens, lang_mask,
-                           sg_main, sg_wrist, sg_state)
+                           curr_main, curr_wrist, sg_main, sg_wrist, sg_state)
         loss.backward()
         nn.utils.clip_grad_norm_(trainable, 1.0)
         optimizer.step()
@@ -404,5 +574,6 @@ def train():
 if __name__ == "__main__":
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     if local_rank == 0:
-        extract_images_and_lang()
+        extract_images_and_lang()      # Phase 0:   raw images + language cache
+        extract_sg_encoder_latents()   # Phase 0.5: encoder latents cache
     train()

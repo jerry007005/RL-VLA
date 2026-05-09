@@ -30,6 +30,7 @@ from model.pi0_subgoal_decoder import PI0WithGoalExpert
 
 FEAT_CACHE_DIR    = "/mnt/nfs/Users/jerry007005/dataset/executor_feat_cache"
 SUBGOAL_CACHE_DIR = "/mnt/nfs/Users/jerry007005/dataset/subgoal_decoder_cache"
+SG_ENC_CACHE_DIR  = "/mnt/nfs/Users/jerry007005/dataset/sg_encoder_cache"
 
 EXECUTOR_CKPT   = "./checkpoints/executor/checkpoint.pt"
 GOAL_EXPERT_CKPT = "./checkpoints/subgoal_decoder/checkpoint.pt"
@@ -67,6 +68,7 @@ def load_executor() -> Executor:
 
 def load_goal_expert() -> PI0WithGoalExpert:
     from openpi.training import config as _config
+    from peft import get_peft_model, LoraConfig
     import safetensors.torch
 
     train_cfg = _config.get_config("pi05_libero")
@@ -75,13 +77,24 @@ def load_goal_expert() -> PI0WithGoalExpert:
         proprio_dim=PROPRIO_DIM, freeze_pi0=True,
     ).to(DEVICE)
 
-    # Load PI0 backbone weights
+    # 1. Load PI0 base weights (before LoRA renames keys)
     safetensors.torch.load_model(
         model, os.path.join(PI05_CKPT_DIR, "model.safetensors"), strict=False,
     )
-    # Load goal expert weights
+    # 2. Apply LoRA with same config as training
+    lora_cfg = LoraConfig(
+        r=8, lora_alpha=16,
+        target_modules=["q_proj", "v_proj"],
+        lora_dropout=0.0,
+        bias="none",
+    )
+    model.paligemma_with_expert.paligemma.language_model = get_peft_model(
+        model.paligemma_with_expert.paligemma.language_model, lora_cfg,
+    )
+    # 3. Load trained weights (LoRA + goal expert, strip torch.compile prefix)
     ckpt = torch.load(GOAL_EXPERT_CKPT, map_location=DEVICE)
-    model.load_state_dict(ckpt["model"])
+    state = {k.replace("_orig_mod.", ""): v for k, v in ckpt["model"].items()}
+    model.load_state_dict(state)
     model.eval()
     step = ckpt.get("step", "?")
     print(f"GoalExpert loaded (step {step})")
@@ -92,40 +105,52 @@ def load_goal_expert() -> PI0WithGoalExpert:
 # Data helpers
 # ---------------------------------------------------------------------------
 
-def load_episodes(feat_cache_dir: str, subgoal_cache_dir: str | None = None,
+def load_episodes(feat_cache_dir: str, sg_enc_cache_dir: str,
+                  subgoal_cache_dir: str | None = None,
                   max_episodes: int | None = None):
     """
     Returns list of episode dicts.
-    If subgoal_cache_dir given, also loads raw images + lang tokens for Test 2.
+    feat_cache_dir    : executor_feat_cache  (z, actions)
+    sg_enc_cache_dir  : sg_encoder_cache     (z, states, sg_frames)
+    subgoal_cache_dir : subgoal_decoder_cache (raw imgs + lang) for Test 2
     """
     feat_path = Path(feat_cache_dir)
-    index = json.loads((feat_path / "index.json").read_text())
+    enc_path  = Path(sg_enc_cache_dir)
+
+    feat_index = json.loads((feat_path / "index.json").read_text())
+    enc_index  = {e["ep_idx"]: e for e in json.loads((enc_path / "index.json").read_text())}
+
     if max_episodes:
-        index = index[:max_episodes]
+        feat_index = feat_index[:max_episodes]
 
     episodes = []
-    for entry in index:
-        ep_idx   = entry["ep_idx"]
+    for entry in feat_index:
+        ep_idx = entry["ep_idx"]
+        if ep_idx not in enc_index:
+            continue
+
         feat     = np.load(feat_path / entry["file"])
+        enc_data = np.load(enc_path  / enc_index[ep_idx]["file"])
+
+        z         = enc_data["z"].astype(np.float32)          # (N, 4096)
         ep = {
-            "ep_idx":      ep_idx,
-            "n_steps":     entry["n_steps"],
-            "main_feats":  feat["main_feats"].astype(np.float32),   # (N, 2048)
-            "wrist_feats": feat["wrist_feats"].astype(np.float32),  # (N, 2048)
-            "states":      feat["states"].astype(np.float32),       # (N, 8)
-            "actions":     feat["actions"].astype(np.float32),      # (N, 7)
-            "sg_frames":   feat["sg_frames"].astype(np.int32),      # (N,)
+            "ep_idx":    ep_idx,
+            "n_steps":   entry["n_steps"],
+            "z":         z,                                    # (N, 4096)
+            "states":    enc_data["states"].astype(np.float32),  # (N, 8)
+            "actions":   feat["actions"].astype(np.float32),     # (N, 7)
+            "sg_frames": enc_data["sg_frames"].astype(np.int32), # (N,)
         }
         if subgoal_cache_dir is not None:
             sg_file = Path(subgoal_cache_dir) / f"ep_{ep_idx:04d}.npz"
             if sg_file.exists():
                 sg = np.load(sg_file)
-                ep["main_imgs"]  = sg["main_imgs"]   # (N, 224, 224, 3) uint8
-                ep["wrist_imgs"] = sg["wrist_imgs"]
+                ep["main_imgs"]   = sg["main_imgs"]
+                ep["wrist_imgs"]  = sg["wrist_imgs"]
                 ep["lang_tokens"] = torch.from_numpy(sg["lang_tokens"].astype(np.int64))
                 ep["lang_mask"]   = torch.from_numpy(sg["lang_mask"].astype(bool))
             else:
-                ep["main_imgs"] = None  # flag: skip this ep in Test 2
+                ep["main_imgs"] = None
         episodes.append(ep)
 
     print(f"Loaded {len(episodes)} episodes")
@@ -149,13 +174,14 @@ def eval_gt(executor: Executor, episodes: list) -> dict:
 
     for ep in tqdm(episodes, desc="Test 1 (gt subgoal)"):
         N = ep["n_steps"]
-        sg_idx = ep["sg_frames"]                          # (N,)
+        sg_idx = ep["sg_frames"]                           # (N,)
 
-        curr_main  = torch.from_numpy(ep["main_feats"])   # (N, 2048)
-        curr_wrist = torch.from_numpy(ep["wrist_feats"])
+        z         = ep["z"]                                # (N, 4096)
+        curr_main  = torch.from_numpy(z[:, :PATCH_DIM])   # (N, 2048)
+        curr_wrist = torch.from_numpy(z[:, PATCH_DIM:])   # (N, 2048)
         curr_state = torch.from_numpy(ep["states"])
-        sg_main    = torch.from_numpy(ep["main_feats"][sg_idx])
-        sg_wrist   = torch.from_numpy(ep["wrist_feats"][sg_idx])
+        sg_main    = torch.from_numpy(z[sg_idx, :PATCH_DIM])
+        sg_wrist   = torch.from_numpy(z[sg_idx, PATCH_DIM:])
         sg_state   = torch.from_numpy(ep["states"][sg_idx])
         actions    = torch.from_numpy(ep["actions"])
 
@@ -201,8 +227,9 @@ def eval_generated(executor: Executor, goal_expert: PI0WithGoalExpert,
             continue
 
         N          = ep["n_steps"]
-        curr_main  = torch.from_numpy(ep["main_feats"])
-        curr_wrist = torch.from_numpy(ep["wrist_feats"])
+        z          = ep["z"]                               # (N, 4096)
+        curr_main  = torch.from_numpy(z[:, :PATCH_DIM])
+        curr_wrist = torch.from_numpy(z[:, PATCH_DIM:])
         curr_state = torch.from_numpy(ep["states"])
         actions    = torch.from_numpy(ep["actions"])
 
@@ -216,12 +243,14 @@ def eval_generated(executor: Executor, goal_expert: PI0WithGoalExpert,
             B    = min(GOAL_BATCH, N - i)
             imgs = _img_to_chw(ep["main_imgs"][sl]).to(DEVICE)    # (B, 3, H, W)
             wrist= _img_to_chw(ep["wrist_imgs"][sl]).to(DEVICE)
+            curr_z = torch.from_numpy(z[sl]).to(DEVICE)           # (B, 4096)
 
             sg_m, sg_w, sg_s = goal_expert.sample_goal(
                 imgs,
                 wrist,
                 lang_tok.expand(B, -1).to(DEVICE),
                 lang_mask.expand(B, -1).to(DEVICE),
+                curr_z,
             )
             sg_main_list.append(sg_m.cpu())
             sg_wrist_list.append(sg_w.cpu())
@@ -259,7 +288,136 @@ def eval_generated(executor: Executor, goal_expert: PI0WithGoalExpert,
 
 
 # ---------------------------------------------------------------------------
-# Test 3: black (zero) subgoal — baseline
+# Test 3: generated image embeddings + ground-truth subgoal state
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def eval_gen_img_gt_state(executor: Executor, goal_expert: PI0WithGoalExpert,
+                          episodes: list) -> dict:
+    """Gen subgoal image embeddings + GT subgoal state."""
+    all_l1, all_per_dim = [], []
+
+    for ep in tqdm(episodes, desc="Test 3 (gen img / gt state)"):
+        if ep.get("main_imgs") is None:
+            continue
+
+        N         = ep["n_steps"]
+        z         = ep["z"]
+        curr_main  = torch.from_numpy(z[:, :PATCH_DIM])
+        curr_wrist = torch.from_numpy(z[:, PATCH_DIM:])
+        curr_state = torch.from_numpy(ep["states"])
+        actions    = torch.from_numpy(ep["actions"])
+        sg_frames  = ep["sg_frames"]
+        sg_state   = torch.from_numpy(ep["states"][sg_frames])  # GT state
+
+        lang_tok  = ep["lang_tokens"].unsqueeze(0)
+        lang_mask = ep["lang_mask"].unsqueeze(0)
+
+        sg_main_list, sg_wrist_list = [], []
+        for i in range(0, N, GOAL_BATCH):
+            sl = slice(i, i + GOAL_BATCH)
+            B  = min(GOAL_BATCH, N - i)
+            imgs  = _img_to_chw(ep["main_imgs"][sl]).to(DEVICE)
+            wrist = _img_to_chw(ep["wrist_imgs"][sl]).to(DEVICE)
+            sg_m, sg_w, _ = goal_expert.sample_goal(
+                imgs, wrist,
+                lang_tok.expand(B, -1).to(DEVICE),
+                lang_mask.expand(B, -1).to(DEVICE),
+                torch.from_numpy(z[sl]).to(DEVICE),
+            )
+            sg_main_list.append(sg_m.cpu())
+            sg_wrist_list.append(sg_w.cpu())
+
+        sg_main  = torch.cat(sg_main_list,  dim=0)
+        sg_wrist = torch.cat(sg_wrist_list, dim=0)
+
+        l1_ep = []
+        for i in range(0, N, EVAL_BATCH):
+            sl = slice(i, i + EVAL_BATCH)
+            imgs = torch.stack([
+                curr_main[sl], curr_wrist[sl], sg_main[sl], sg_wrist[sl]
+            ], dim=1).to(DEVICE)
+            pred, _, _ = executor(
+                imgs, curr_state[sl].to(DEVICE), sg_state[sl].to(DEVICE),
+                deterministic=True,
+            )
+            l1 = F.l1_loss(pred, actions[sl].to(DEVICE), reduction="none")
+            l1_ep.append(l1.cpu())
+
+        l1_ep = torch.cat(l1_ep, dim=0)
+        all_l1.append(l1_ep.mean().item())
+        all_per_dim.append(l1_ep.mean(dim=0))
+
+    per_dim = torch.stack(all_per_dim).mean(dim=0)
+    return {"mean_l1": float(np.mean(all_l1)), "per_dim": per_dim.tolist()}
+
+
+# ---------------------------------------------------------------------------
+# Test 4: ground-truth image embeddings + generated subgoal state
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def eval_gt_img_gen_state(executor: Executor, goal_expert: PI0WithGoalExpert,
+                          episodes: list) -> dict:
+    """GT subgoal image embeddings + gen subgoal state."""
+    all_l1, all_per_dim = [], []
+
+    for ep in tqdm(episodes, desc="Test 4 (gt img / gen state)"):
+        if ep.get("main_imgs") is None:
+            continue
+
+        N         = ep["n_steps"]
+        z         = ep["z"]
+        curr_main  = torch.from_numpy(z[:, :PATCH_DIM])
+        curr_wrist = torch.from_numpy(z[:, PATCH_DIM:])
+        curr_state = torch.from_numpy(ep["states"])
+        actions    = torch.from_numpy(ep["actions"])
+        sg_frames  = ep["sg_frames"]
+        sg_main    = torch.from_numpy(z[sg_frames, :PATCH_DIM])  # GT img
+        sg_wrist   = torch.from_numpy(z[sg_frames, PATCH_DIM:])  # GT img
+
+        lang_tok  = ep["lang_tokens"].unsqueeze(0)
+        lang_mask = ep["lang_mask"].unsqueeze(0)
+
+        sg_state_list = []
+        for i in range(0, N, GOAL_BATCH):
+            sl = slice(i, i + GOAL_BATCH)
+            B  = min(GOAL_BATCH, N - i)
+            imgs  = _img_to_chw(ep["main_imgs"][sl]).to(DEVICE)
+            wrist = _img_to_chw(ep["wrist_imgs"][sl]).to(DEVICE)
+            _, _, sg_s = goal_expert.sample_goal(
+                imgs, wrist,
+                lang_tok.expand(B, -1).to(DEVICE),
+                lang_mask.expand(B, -1).to(DEVICE),
+                torch.from_numpy(z[sl]).to(DEVICE),
+            )
+            sg_state_list.append(sg_s.cpu())
+
+        sg_state = torch.cat(sg_state_list, dim=0)
+
+        l1_ep = []
+        for i in range(0, N, EVAL_BATCH):
+            sl = slice(i, i + EVAL_BATCH)
+            imgs = torch.stack([
+                curr_main[sl], curr_wrist[sl], sg_main[sl], sg_wrist[sl]
+            ], dim=1).to(DEVICE)
+            pred, _, _ = executor(
+                imgs, curr_state[sl].to(DEVICE), sg_state[sl].to(DEVICE),
+                deterministic=True,
+            )
+            l1 = F.l1_loss(pred, actions[sl].to(DEVICE), reduction="none")
+            l1_ep.append(l1.cpu())
+
+        l1_ep = torch.cat(l1_ep, dim=0)
+        all_l1.append(l1_ep.mean().item())
+        all_per_dim.append(l1_ep.mean(dim=0))
+
+    per_dim = torch.stack(all_per_dim).mean(dim=0)
+    return {"mean_l1": float(np.mean(all_l1)), "per_dim": per_dim.tolist()}
+
+
+# ---------------------------------------------------------------------------
+# Test 5: black (zero) subgoal — baseline
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
@@ -267,11 +425,12 @@ def eval_black(executor: Executor, episodes: list) -> dict:
     """Replace subgoal with all-zeros to measure executor's reliance on subgoal."""
     all_l1, all_per_dim = [], []
 
-    for ep in tqdm(episodes, desc="Test 3 (black subgoal)"):
+    for ep in tqdm(episodes, desc="Test 5 (black subgoal)"):
         N = ep["n_steps"]
 
-        curr_main  = torch.from_numpy(ep["main_feats"])
-        curr_wrist = torch.from_numpy(ep["wrist_feats"])
+        z          = ep["z"]                               # (N, 4096)
+        curr_main  = torch.from_numpy(z[:, :PATCH_DIM])
+        curr_wrist = torch.from_numpy(z[:, PATCH_DIM:])
         curr_state = torch.from_numpy(ep["states"])
         actions    = torch.from_numpy(ep["actions"])
 
@@ -318,50 +477,57 @@ def main():
     args = parser.parse_args()
 
     executor = load_executor()
-    episodes = load_episodes(FEAT_CACHE_DIR, max_episodes=args.max_episodes)
+    episodes = load_episodes(FEAT_CACHE_DIR, SG_ENC_CACHE_DIR, max_episodes=args.max_episodes)
 
     # Test 1: ground truth subgoal
     gt_results = eval_gt(executor, episodes)
 
-    # Test 2: generated subgoal
+    # Tests 2/3/4 all need goal expert + raw images
+    gen_results = gen_img_gt_state_results = gt_img_gen_state_results = None
     if not args.skip_gen:
         goal_expert = load_goal_expert()
         episodes_with_imgs = load_episodes(
-            FEAT_CACHE_DIR, SUBGOAL_CACHE_DIR, max_episodes=args.max_episodes
+            FEAT_CACHE_DIR, SG_ENC_CACHE_DIR, SUBGOAL_CACHE_DIR, max_episodes=args.max_episodes
         )
+        # Test 2: gen img + gen state
         gen_results = eval_generated(executor, goal_expert, episodes_with_imgs)
-    else:
-        gen_results = None
+        # Test 3: gen img + GT state
+        gen_img_gt_state_results = eval_gen_img_gt_state(executor, goal_expert, episodes_with_imgs)
+        # Test 4: GT img + gen state
+        gt_img_gen_state_results = eval_gt_img_gen_state(executor, goal_expert, episodes_with_imgs)
 
-    # Test 3: black (zero) subgoal
+    # Test 5: black (zero) subgoal
     black_results = eval_black(executor, episodes)
 
     # Print results
     dim_names = ["x", "y", "z", "rx", "ry", "rz", "gripper"]
-    print("\n" + "=" * 70)
-    print(f"{'Condition':<22} {'Mean L1':>8}   per-dim L1")
-    print("=" * 70)
+    print("\n" + "=" * 80)
+    print(f"{'Condition':<28} {'Mean L1':>8}   per-dim L1")
+    print("=" * 80)
 
     def _row(name, res):
         dims = "  ".join(f"{v:.4f}" for v in res["per_dim"])
-        print(f"{name:<22} {res['mean_l1']:>8.4f}   {dims}")
+        print(f"{name:<28} {res['mean_l1']:>8.4f}   {dims}")
 
-    _row("GT subgoal",    gt_results)
+    _row("T1  GT img + GT state",       gt_results)
     if gen_results:
-        _row("Gen subgoal",   gen_results)
-    _row("Black subgoal", black_results)
+        _row("T2  Gen img + gen state",  gen_results)
+    if gen_img_gt_state_results:
+        _row("T3  Gen img + GT state",   gen_img_gt_state_results)
+    if gt_img_gen_state_results:
+        _row("T4  GT img + gen state",   gt_img_gen_state_results)
+    _row("T5  Black subgoal",            black_results)
 
-    print("-" * 70)
+    print("-" * 80)
+    ref = gt_results["mean_l1"]
     if gen_results:
-        d_gen   = gen_results["mean_l1"]   - gt_results["mean_l1"]
-        d_black = black_results["mean_l1"] - gt_results["mean_l1"]
-        print(f"  Delta gen   - gt : {d_gen:+.4f}")
-        print(f"  Delta black - gt : {d_black:+.4f}")
-    else:
-        d_black = black_results["mean_l1"] - gt_results["mean_l1"]
-        print(f"  Delta black - gt : {d_black:+.4f}")
-
-    print("=" * 70)
+        print(f"  T2 - T1 (full gen gap)       : {gen_results['mean_l1']           - ref:+.4f}")
+    if gen_img_gt_state_results:
+        print(f"  T3 - T1 (img gen gap)        : {gen_img_gt_state_results['mean_l1'] - ref:+.4f}")
+    if gt_img_gen_state_results:
+        print(f"  T4 - T1 (state gen gap)      : {gt_img_gen_state_results['mean_l1'] - ref:+.4f}")
+    print(f"  T5 - T1 (no subgoal gap)     : {black_results['mean_l1']           - ref:+.4f}")
+    print("=" * 80)
     print(f"  Dims: {dim_names}")
 
 

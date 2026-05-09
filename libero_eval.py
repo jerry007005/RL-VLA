@@ -29,6 +29,7 @@ from openpi_client import image_tools
 
 from model.executor            import Executor
 from model.pi0_subgoal_decoder import PI0WithGoalExpert
+from model.subgoal_encoder     import SubgoalAutoencoder
 
 LIBERO_DUMMY_ACTION    = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION  = 256
@@ -59,6 +60,7 @@ class Args:
     run_id_note:        str = None
     executor_ckpt:      str = "./checkpoints/executor/checkpoint.pt"
     goal_expert_ckpt:   str = "./checkpoints/subgoal_decoder/checkpoint.pt"
+    encoder_ckpt:       str = "./checkpoints/subgoal_encoder/checkpoint.pt"
     pi05_ckpt_dir:      str = "/mnt/nfs/Users/jerry007005/model/openpi/pi05_libero"
     save_video:         bool = True   # save per-episode MP4 to local_log_dir/videos/
     video_fps:          int  = 10
@@ -82,6 +84,7 @@ def _load_executor(ckpt_path: str) -> Executor:
 
 def _load_goal_expert(goal_ckpt: str, pi05_ckpt_dir: str) -> PI0WithGoalExpert:
     from openpi.training import config as _config
+    from peft import get_peft_model, LoraConfig
     import safetensors.torch
 
     train_cfg = _config.get_config("pi05_libero")
@@ -89,11 +92,24 @@ def _load_goal_expert(goal_ckpt: str, pi05_ckpt_dir: str) -> PI0WithGoalExpert:
         config=train_cfg.model, patch_dim=PATCH_DIM,
         proprio_dim=PROPRIO_DIM, freeze_pi0=True,
     ).to(DEVICE)
+    # 1. Load PI0 base weights (before LoRA renames keys)
     safetensors.torch.load_model(
         model, os.path.join(pi05_ckpt_dir, "model.safetensors"), strict=False,
     )
+    # 2. Apply LoRA with same config as training
+    lora_cfg = LoraConfig(
+        r=8, lora_alpha=16,
+        target_modules=["q_proj", "v_proj"],
+        lora_dropout=0.0,
+        bias="none",
+    )
+    model.paligemma_with_expert.paligemma.language_model = get_peft_model(
+        model.paligemma_with_expert.paligemma.language_model, lora_cfg,
+    )
+    # 3. Load trained weights (LoRA + goal expert), strip torch.compile prefix
     ckpt = torch.load(goal_ckpt, map_location=DEVICE)
-    model.load_state_dict(ckpt["model"])
+    state = {k.replace("_orig_mod.", ""): v for k, v in ckpt["model"].items()}
+    model.load_state_dict(state)
     model.eval()
     print(f"GoalExpert loaded from {goal_ckpt} (step {ckpt.get('step','?')})")
     return model
@@ -122,11 +138,36 @@ def _get_state(obs: dict) -> torch.Tensor:
     return torch.from_numpy(state.astype(np.float32)).unsqueeze(0).to(DEVICE)
 
 
+def _load_subgoal_encoder(ckpt_path: str) -> SubgoalAutoencoder:
+    ae = SubgoalAutoencoder(
+        patch_dim=PATCH_DIM, n_queries=2, n_patches=512,
+        n_heads=16, enc_layers=2, dec_layers=2, ffn_mult=4,
+    )
+    ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
+    ae.load_state_dict(ckpt["model"])
+    ae.eval().to(DEVICE)
+    for p in ae.parameters():
+        p.requires_grad_(False)
+    print(f"SubgoalEncoder loaded from {ckpt_path}")
+    return ae
+
+
 @torch.no_grad()
-def _encode_img(goal_expert: PI0WithGoalExpert, img_t: torch.Tensor) -> torch.Tensor:
-    """(1, 3, H, W) → (1, 2048) mean-pooled SigLIP feature."""
-    patches = goal_expert.paligemma_with_expert.embed_image(img_t)  # (1, 256, 2048)
-    return patches.mean(dim=1).float()                               # (1, 2048)
+def _encode_obs(
+    goal_expert: PI0WithGoalExpert,
+    subgoal_enc: SubgoalAutoencoder,
+    main_t:  torch.Tensor,   # (1, 3, H, W)
+    wrist_t: torch.Tensor,   # (1, 3, H, W)
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Returns (curr_main, curr_wrist) each (1, 2048) as SubgoalAutoencoder latents —
+    the same representation the executor and goal expert were trained on.
+    """
+    main_patches  = goal_expert.paligemma_with_expert.embed_image(main_t).float()   # (1, 256, 2048)
+    wrist_patches = goal_expert.paligemma_with_expert.embed_image(wrist_t).float()  # (1, 256, 2048)
+    patches = torch.cat([main_patches, wrist_patches], dim=1)                       # (1, 512, 2048)
+    z = subgoal_enc.encode(patches)                                                  # (1, 4096)
+    return z[:, :PATCH_DIM], z[:, PATCH_DIM:]                                       # (1,2048), (1,2048)
 
 
 def _make_tokenizer(max_len: int):
@@ -184,6 +225,7 @@ def eval_libero(args: Args) -> None:
     # Load models
     executor    = _load_executor(args.executor_ckpt)
     goal_expert = _load_goal_expert(args.goal_expert_ckpt, args.pi05_ckpt_dir)
+    subgoal_enc = _load_subgoal_encoder(args.encoder_ckpt)
     tokenizer   = _make_tokenizer(args.max_lang_len)
 
     # Task suite
@@ -240,18 +282,20 @@ def eval_libero(args: Args) -> None:
                     wrist_t = _preprocess_img(raw_wrist, args.resize_size)
                     state_t = _get_state(obs)                                # (1, 8)
 
+                    # Encode current obs via SigLIP + SubgoalAutoencoder
+                    with torch.no_grad():
+                        curr_main, curr_wrist = _encode_obs(
+                            goal_expert, subgoal_enc, main_t, wrist_t
+                        )  # each (1, 2048) SAE latent
+                        curr_z = torch.cat([curr_main, curr_wrist], dim=-1)  # (1, 4096)
+
                     # Replan subgoal if needed
                     if step_since_replan >= args.replan_steps:
                         with torch.no_grad():
                             sg_main, sg_wrist, sg_state = goal_expert.sample_goal(
-                                main_t, wrist_t, lang_tokens, lang_mask,
+                                main_t, wrist_t, lang_tokens, lang_mask, curr_z,
                             )
                         step_since_replan = 0
-
-                    # Encode current obs via SigLIP
-                    with torch.no_grad():
-                        curr_main  = _encode_img(goal_expert, main_t)   # (1, 2048)
-                        curr_wrist = _encode_img(goal_expert, wrist_t)  # (1, 2048)
 
                     # Build Executor input
                     imgs = torch.stack(

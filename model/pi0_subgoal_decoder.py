@@ -83,12 +83,14 @@ class PI0WithGoalExpert(PI0Pytorch):
         self.patch_dim   = patch_dim
         self.proprio_dim = proprio_dim
 
-        # Action quantile norm stats from pi0.5 (required).
+        # Action + state quantile norm stats from pi0.5 (required).
         import json as _json
-        ns = _json.loads(Path(norm_stats_path).read_text())["norm_stats"]["actions"]
-        self.register_buffer("action_q01", torch.tensor(ns["q01"], dtype=torch.float32))
-        self.register_buffer("action_q99", torch.tensor(ns["q99"], dtype=torch.float32))
-        print(f"[PI0WithGoalExpert] Loaded action norm_stats from {norm_stats_path}")
+        ns = _json.loads(Path(norm_stats_path).read_text())["norm_stats"]
+        self.register_buffer("action_q01", torch.tensor(ns["actions"]["q01"], dtype=torch.float32))
+        self.register_buffer("action_q99", torch.tensor(ns["actions"]["q99"], dtype=torch.float32))
+        self.register_buffer("state_q01",  torch.tensor(ns["state"]["q01"],   dtype=torch.float32))
+        self.register_buffer("state_q99",  torch.tensor(ns["state"]["q99"],   dtype=torch.float32))
+        print(f"[PI0WithGoalExpert] Loaded action+state norm_stats from {norm_stats_path}")
 
         if freeze_pi0:
             for p in self.parameters():
@@ -170,6 +172,12 @@ class PI0WithGoalExpert(PI0Pytorch):
 
     def _unnormalize_action(self, a: torch.Tensor) -> torch.Tensor:
         return (a + 1.0) / 2.0 * (self.action_q99 - self.action_q01) + self.action_q01
+
+    def _normalize_state(self, s: torch.Tensor) -> torch.Tensor:
+        return (s - self.state_q01) / (self.state_q99 - self.state_q01) * 2.0 - 1.0
+
+    def _unnormalize_state(self, s: torch.Tensor) -> torch.Tensor:
+        return (s + 1.0) / 2.0 * (self.state_q99 - self.state_q01) + self.state_q01
 
     # ------------------------------------------------------------------
     # Checkpoint helpers (save/load only trainable + buffers, skip PI0 backbone)
@@ -356,17 +364,18 @@ class PI0WithGoalExpert(PI0Pytorch):
         if noise_state is None: noise_state = self._sample_noise(sg_state.shape, device)
         if time        is None: time        = self._sample_time(B, device)
 
-        # Flow matching on delta (sg - curr) for visual tokens; state stays absolute.
+        # Flow matching on delta (sg - curr) for visual tokens; state in normalized space.
         delta_main  = sg_main  - curr_main
         delta_wrist = sg_wrist - curr_wrist
+        sg_state_n  = self._normalize_state(sg_state)
 
         t = time[:, None]
         noisy_main  = t * noise_main  + (1 - t) * delta_main
         noisy_wrist = t * noise_wrist + (1 - t) * delta_wrist
-        noisy_state = t * noise_state + (1 - t) * sg_state
+        noisy_state = t * noise_state + (1 - t) * sg_state_n
         u_main  = noise_main  - delta_main
         u_wrist = noise_wrist - delta_wrist
-        u_state = noise_state - sg_state
+        u_state = noise_state - sg_state_n
 
         prefix_kv, prefix_pad = self._prefix_kv_cache(
             main_img, wrist_img, lang_tokens, lang_mask
@@ -456,9 +465,10 @@ class PI0WithGoalExpert(PI0Pytorch):
             x_state = x_state + dt * v_state
             t = t + dt
 
-        # x_main/x_wrist are deltas; recover absolute subgoal by adding curr.
+        # x_main/x_wrist are deltas → absolute by adding curr.
+        # x_state is in normalized [-1,1] space → unnormalize back to raw EEF scale.
         # horizon_pred is in steps (float), from the final denoising step.
-        return curr_main + x_main, curr_wrist + x_wrist, x_state, horizon_pred
+        return curr_main + x_main, curr_wrist + x_wrist, self._unnormalize_state(x_state), horizon_pred
 
     @torch.no_grad()
     def sample_all(
@@ -506,7 +516,7 @@ class PI0WithGoalExpert(PI0Pytorch):
 
         sg_main  = curr_main + x_main
         sg_wrist = curr_wrist + x_wrist
-        sg_state = x_state
+        sg_state = self._unnormalize_state(x_state)   # back to raw EEF scale
 
         # ---- PI0.5 action denoising (reuses same prefix KV) ----
         action_shape = (B, self.config.action_horizon, self.config.action_dim)

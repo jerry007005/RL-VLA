@@ -43,6 +43,9 @@ SG_ENCODER_CACHE_DIR = "/mnt/nfs/Users/jerry007005/dataset/sg_encoder_cache"
 CKPT_DIR             = "./checkpoints/subgoal_decoder"
 
 PI05_CKPT_DIR     = "/mnt/nfs/Users/jerry007005/model/openpi/pi05_libero"
+NORM_STATS_PATH   = os.path.join(
+    PI05_CKPT_DIR, "assets", "physical-intelligence", "libero", "norm_stats.json"
+)
 ENCODER_CKPT_PATH = "./checkpoints/subgoal_encoder/checkpoint.pt"
 
 IMG_SIZE     = 224
@@ -387,11 +390,12 @@ def _load_model() -> PI0WithGoalExpert:
     print("Loading PI0WithGoalExpert ...")
     train_cfg = _config.get_config("pi05_libero")
     model = PI0WithGoalExpert(
-        config         = train_cfg.model,
-        patch_dim      = PATCH_DIM,
-        proprio_dim    = PROPRIO_DIM,
-        freeze_pi0     = True,
-        expert_variant = "gemma_300m",
+        config          = train_cfg.model,
+        patch_dim       = PATCH_DIM,
+        proprio_dim     = PROPRIO_DIM,
+        freeze_pi0      = True,
+        expert_variant  = "gemma_300m",
+        norm_stats_path = NORM_STATS_PATH,
     )
     # 1. Load PI0 base weights first (before LoRA renames keys)
     safetensors.torch.load_model(

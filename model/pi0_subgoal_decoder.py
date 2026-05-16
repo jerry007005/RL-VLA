@@ -76,29 +76,19 @@ class PI0WithGoalExpert(PI0Pytorch):
         proprio_dim:    int  = 8,
         freeze_pi0:     bool = True,
         expert_variant: str  = "gemma_2b",
-        norm_stats_path: str = None,
+        norm_stats_path: str = None,  # pi0.5 norm_stats.json
     ):
         super().__init__(config=config)
 
         self.patch_dim   = patch_dim
         self.proprio_dim = proprio_dim
 
-        # Action quantile norm stats: loaded once, moved with model via register_buffer
-        if norm_stats_path is not None:
-            import json as _json
-            _p = Path(norm_stats_path)
-            if _p.exists():
-                _ns = _json.loads(_p.read_text())["norm_stats"]["actions"]
-                self.register_buffer("action_q01", torch.tensor(_ns["q01"], dtype=torch.float32))
-                self.register_buffer("action_q99", torch.tensor(_ns["q99"], dtype=torch.float32))
-                print(f"[PI0WithGoalExpert] Loaded action norm_stats from {_p}")
-            else:
-                print(f"[PI0WithGoalExpert] Warning: norm_stats not found at {norm_stats_path}")
-                self.action_q01 = None
-                self.action_q99 = None
-        else:
-            self.action_q01 = None
-            self.action_q99 = None
+        # Action quantile norm stats from pi0.5 (required).
+        import json as _json
+        ns = _json.loads(Path(norm_stats_path).read_text())["norm_stats"]["actions"]
+        self.register_buffer("action_q01", torch.tensor(ns["q01"], dtype=torch.float32))
+        self.register_buffer("action_q99", torch.tensor(ns["q99"], dtype=torch.float32))
+        print(f"[PI0WithGoalExpert] Loaded action norm_stats from {norm_stats_path}")
 
         if freeze_pi0:
             for p in self.parameters():
@@ -169,6 +159,16 @@ class PI0WithGoalExpert(PI0Pytorch):
     def _sample_time(self, B, device):
         t = sample_beta(1.5, 1.0, B, device)
         return (t * 0.95 + 0.05).to(dtype=torch.float32, device=device)
+
+    # ------------------------------------------------------------------
+    # Action norm helpers (pi0.5 action quantiles)
+    # ------------------------------------------------------------------
+
+    def _normalize_action(self, a: torch.Tensor) -> torch.Tensor:
+        return (a - self.action_q01) / (self.action_q99 - self.action_q01) * 2.0 - 1.0
+
+    def _unnormalize_action(self, a: torch.Tensor) -> torch.Tensor:
+        return (a + 1.0) / 2.0 * (self.action_q99 - self.action_q01) + self.action_q01
 
     # ------------------------------------------------------------------
     # Prefix: current obs → KV cache
@@ -496,11 +496,8 @@ class PI0WithGoalExpert(PI0Pytorch):
             x_t = x_t + dt_a * v_t
             t_a = t_a + dt_a
 
-        actions = x_t.float()
-        if self.action_q01 is not None:
-            env_dim = self.action_q01.shape[0]   # 7 for LIBERO; trim padding dims
-            actions = actions[:, :, :env_dim]
-            actions = (actions + 1.0) / 2.0 * (self.action_q99 - self.action_q01) + self.action_q01
+        actions = x_t.float()[:, :, :self.action_q01.shape[0]]   # trim padding dims
+        actions = self._unnormalize_action(actions)
         return actions, sg_main, sg_wrist, sg_state, horizon_pred
 
     @torch.no_grad()
@@ -534,9 +531,6 @@ class PI0WithGoalExpert(PI0Pytorch):
             x_t = x_t + dt * v_t
             t = t + dt
 
-        actions = x_t.float()
-        if self.action_q01 is not None:
-            env_dim = self.action_q01.shape[0]   # 7 for LIBERO; trim padding dims
-            actions = actions[:, :, :env_dim]
-            actions = (actions + 1.0) / 2.0 * (self.action_q99 - self.action_q01) + self.action_q01
+        actions = x_t.float()[:, :, :self.action_q01.shape[0]]   # trim padding dims
+        actions = self._unnormalize_action(actions)
         return actions

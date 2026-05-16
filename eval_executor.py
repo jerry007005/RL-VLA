@@ -28,13 +28,16 @@ from model.pi0_subgoal_decoder import PI0WithGoalExpert
 # Config (match train.py / train_subgoal_decoder.py)
 # ---------------------------------------------------------------------------
 
-FEAT_CACHE_DIR    = "/mnt/nfs/Users/jerry007005/dataset/executor_feat_cache"
+FEAT_CACHE_DIR    = "/mnt/nfs/Users/jerry007005/dataset/executor_feat_cache/libero_10_no_noops"
 SUBGOAL_CACHE_DIR = "/mnt/nfs/Users/jerry007005/dataset/subgoal_decoder_cache"
 SG_ENC_CACHE_DIR  = "/mnt/nfs/Users/jerry007005/dataset/sg_encoder_cache"
 
-EXECUTOR_CKPT   = "./checkpoints/executor/checkpoint.pt"
-GOAL_EXPERT_CKPT = "./checkpoints/subgoal_decoder/checkpoint.pt"
+EXECUTOR_CKPT   = "./checkpoints/v3/executor/checkpoint.pt"
+GOAL_EXPERT_CKPT = "./checkpoints/v3/goal_expert/checkpoint.pt"
 PI05_CKPT_DIR   = "/mnt/nfs/Users/jerry007005/model/openpi/pi05_libero"
+NORM_STATS_PATH = os.path.join(
+    PI05_CKPT_DIR, "assets", "physical-intelligence", "libero", "norm_stats.json"
+)
 
 PATCH_DIM   = 2048
 PROPRIO_DIM = 8
@@ -57,6 +60,7 @@ def load_executor() -> Executor:
     model = Executor(
         num_imgs=4, patch_dim=PATCH_DIM, proprio_dim=PROPRIO_DIM,
         action_dim=ACTION_DIM, hidden_dim=HIDDEN_DIM, num_hidden_layers=NUM_LAYERS,
+        norm_stats_path=NORM_STATS_PATH,
     ).to(DEVICE)
     ckpt = torch.load(EXECUTOR_CKPT, map_location=DEVICE)
     model.load_state_dict(ckpt["model"])
@@ -76,6 +80,7 @@ def load_goal_expert() -> PI0WithGoalExpert:
         config=train_cfg.model, patch_dim=PATCH_DIM,
         proprio_dim=PROPRIO_DIM, freeze_pi0=True,
         expert_variant="gemma_300m",
+        norm_stats_path=NORM_STATS_PATH,
     ).to(DEVICE)
 
     # 1. Load PI0 base weights (before LoRA renames keys)

@@ -37,6 +37,9 @@ CKPT_DIR           = "./checkpoints/executor"
 ENCODER_CKPT_PATH  = "./checkpoints/subgoal_encoder/checkpoint.pt"
 
 PI05_CKPT_DIR = "/mnt/nfs/Users/jerry007005/model/openpi/pi05_libero"
+NORM_STATS_PATH = os.path.join(
+    PI05_CKPT_DIR, "assets", "physical-intelligence", "libero", "norm_stats.json"
+)
 IMG_SIZE      = 224
 PATCH_DIM     = 2048   # pi0.5 SigLIP projection dim
 N_PATCHES     = 512    # 256 main + 256 wrist
@@ -316,6 +319,7 @@ def train():
         action_dim        = ACTION_DIM,
         hidden_dim        = HIDDEN_DIM,
         num_hidden_layers = NUM_LAYERS,
+        norm_stats_path   = NORM_STATS_PATH,
     ).to(DEVICE)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)

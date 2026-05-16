@@ -15,9 +15,11 @@ Output:
   action : (B, action_dim)   single-step action
 """
 
+import json
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from pathlib import Path
 from torch.distributions import Normal
 from typing import Tuple
 
@@ -43,6 +45,7 @@ class Executor(nn.Module):
         hidden_dim: int = 512,
         num_hidden_layers: int = 5,
         log_std_init: float = -2.0,
+        norm_stats_path: str = None,  # pi0.5 norm_stats.json
     ):
         super().__init__()
         self.action_dim = action_dim
@@ -51,11 +54,17 @@ class Executor(nn.Module):
         self.mlp = build_mlp(mlp_input_dim, hidden_dim, action_dim, num_hidden_layers)
         self.log_std = nn.Parameter(torch.full((action_dim,), log_std_init))
 
-        # Optional quantile norm stats — set after loading checkpoint if present
-        self.state_q01  = None
-        self.state_q99  = None
-        self.action_q01 = None
-        self.action_q99 = None
+        # Action quantile norm stats from pi0.5 (required).
+        ns = json.loads(Path(norm_stats_path).read_text())["norm_stats"]["actions"]
+        self.register_buffer("action_q01", torch.tensor(ns["q01"][:action_dim], dtype=torch.float32))
+        self.register_buffer("action_q99", torch.tensor(ns["q99"][:action_dim], dtype=torch.float32))
+        print(f"[Executor] Loaded action norm_stats from {norm_stats_path}")
+
+    def _normalize_action(self, a: torch.Tensor) -> torch.Tensor:
+        return (a - self.action_q01) / (self.action_q99 - self.action_q01) * 2.0 - 1.0
+
+    def _unnormalize_action(self, a: torch.Tensor) -> torch.Tensor:
+        return (a + 1.0) / 2.0 * (self.action_q99 - self.action_q01) + self.action_q01
 
     def forward(
         self,
@@ -63,32 +72,26 @@ class Executor(nn.Module):
         current_proprio: torch.Tensor, # (B, proprio_dim)
         subgoal_proprio: torch.Tensor, # (B, proprio_dim)
         deterministic: bool = False,
+        unnormalize: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor, Normal]:
         """
-        Returns:
-            action   : (B, action_dim)
-            log_prob : (B,)
-            dist     : Normal
+        MLP outputs action in normalized space ([-1, 1]).
+        If unnormalize=True (inference), returns action in raw env scale.
+        If unnormalize=False (loss computation), returns action in normalized space.
         """
         B = imgs.shape[0]
         img_feat = imgs.reshape(B, -1)  # (B, 4*patch_dim)
 
-        # Normalize current state; subgoal_proprio comes from goal expert (already normalized)
-        if self.state_q01 is not None:
-            current_proprio = (current_proprio - self.state_q01) / (self.state_q99 - self.state_q01) * 2.0 - 1.0
-
         x = torch.cat([img_feat, current_proprio, subgoal_proprio], dim=-1)
-        mean = self.mlp(x)  # (B, action_dim)
+        mean = self.mlp(x)  # (B, action_dim) — normalized space
 
         std  = self.log_std.exp().expand_as(mean)
         dist = Normal(mean, std)
         action = mean if deterministic else dist.rsample()
         log_prob = dist.log_prob(action).sum(dim=-1)  # (B,)
 
-        # Unnormalize action output if norm stats are available
-        if self.action_q01 is not None:
-            action = (action + 1.0) / 2.0 * (self.action_q99 - self.action_q01) + self.action_q01
-
+        if unnormalize:
+            action = self._unnormalize_action(action)
         return action, log_prob, dist
 
     def compute_bc_loss(
@@ -96,13 +99,17 @@ class Executor(nn.Module):
         imgs: torch.Tensor,
         current_proprio: torch.Tensor,
         subgoal_proprio: torch.Tensor,
-        target_action: torch.Tensor,   # (B, action_dim)
+        target_action: torch.Tensor,   # (B, action_dim) — raw env scale
     ) -> Tuple[torch.Tensor, dict]:
-        """Behavioral cloning loss: MSE between predicted and ground-truth action."""
-        action, _, dist = self.forward(imgs, current_proprio, subgoal_proprio)
-        loss = F.l1_loss(action, target_action)
+        """BC loss in normalized action space ([-1, 1])."""
+        action_norm, _, dist = self.forward(
+            imgs, current_proprio, subgoal_proprio,
+            deterministic=True, unnormalize=False,
+        )
+        target_norm = self._normalize_action(target_action)
+        loss = F.l1_loss(action_norm, target_norm)
         info = {
-            "loss/bc":     loss.item(),
-            "train/std":   dist.stddev.mean().item(),
+            "loss/bc":   loss.item(),
+            "train/std": dist.stddev.mean().item(),
         }
         return loss, info

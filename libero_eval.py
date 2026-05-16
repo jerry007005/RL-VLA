@@ -72,22 +72,16 @@ class Args:
 # Model loading
 # ---------------------------------------------------------------------------
 
-def _load_executor(ckpt_path: str) -> Executor:
+def _load_executor(ckpt_path: str, norm_stats_path: str) -> Executor:
     model = Executor(
         num_imgs=4, patch_dim=PATCH_DIM, proprio_dim=PROPRIO_DIM,
         action_dim=ACTION_DIM, hidden_dim=HIDDEN_DIM, num_hidden_layers=NUM_LAYERS,
+        norm_stats_path=norm_stats_path,
     ).to(DEVICE)
     ckpt = torch.load(ckpt_path, map_location=DEVICE)
-    model.load_state_dict(ckpt["model"], strict=False)
-    # Inject optional norm stats directly into model
-    msd = ckpt["model"]
-    for key in ("state_q01", "state_q99", "action_q01", "action_q99"):
-        if key in msd:
-            setattr(model, key, msd[key].to(DEVICE))
+    model.load_state_dict(ckpt["model"])
     model.eval()
-    has_norm = "state_q01" in msd
-    print(f"Executor loaded from {ckpt_path} (step {ckpt.get('step','?')})"
-          + (" [with norm stats]" if has_norm else ""))
+    print(f"Executor loaded from {ckpt_path} (step {ckpt.get('step','?')})")
     return model
 
 
@@ -249,7 +243,10 @@ def eval_libero(args: Args) -> None:
     # Load models
     need_executor = args.mode in ("sample_goal", "sample_all")
     need_encoder  = args.mode in ("sample_goal", "sample_all")
-    executor    = _load_executor(args.executor_ckpt)   if need_executor else None
+    ns_path = str(
+        pathlib.Path(args.pi05_ckpt_dir) / "assets" / "physical-intelligence" / "libero" / "norm_stats.json"
+    )
+    executor    = _load_executor(args.executor_ckpt, ns_path) if need_executor else None
     goal_expert = _load_goal_expert(args.goal_expert_ckpt, args.pi05_ckpt_dir)
     subgoal_enc = _load_subgoal_encoder(args.encoder_ckpt) if need_encoder  else None
     tokenizer   = _make_tokenizer(args.max_lang_len)

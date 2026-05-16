@@ -54,11 +54,9 @@ MAX_LANG_LEN = 48
 PATCH_DIM   = 2048
 PROPRIO_DIM = 8
 
-BATCH_SIZE    = 64    # reduced from 128: LoRA backprop through prefix needs more memory
+BATCH_SIZE    = 64
 LR            = 3e-4
 
-LORA_RANK  = 8
-LORA_ALPHA = 16
 WEIGHT_DECAY  = 1e-4
 WARMUP_STEPS  = 2000
 MAX_STEPS     = 100000
@@ -362,27 +360,6 @@ class GoalExpertDataset(IterableDataset):
 # Load model
 # ---------------------------------------------------------------------------
 
-def _apply_lora(model: PI0WithGoalExpert):
-    """Apply LoRA to PaliGemma language model attention layers after base weights are loaded."""
-    from peft import get_peft_model, LoraConfig
-    lora_cfg = LoraConfig(
-        r              = LORA_RANK,
-        lora_alpha     = LORA_ALPHA,
-        target_modules = ["q_proj", "v_proj"],
-        lora_dropout   = 0.0,   # 0 so eval() on backbone doesn't affect training
-        bias           = "none",
-    )
-    model.paligemma_with_expert.paligemma.language_model = get_peft_model(
-        model.paligemma_with_expert.paligemma.language_model,
-        lora_cfg,
-    )
-    n_lora = sum(
-        p.numel() for p in model.paligemma_with_expert.parameters()
-        if p.requires_grad
-    )
-    print(f"  LoRA applied (r={LORA_RANK}): {n_lora/1e6:.2f}M trainable backbone params")
-
-
 def _load_model() -> PI0WithGoalExpert:
     from openpi.training import config as _config
     import safetensors.torch
@@ -397,19 +374,16 @@ def _load_model() -> PI0WithGoalExpert:
         expert_variant  = "gemma_300m",
         norm_stats_path = NORM_STATS_PATH,
     )
-    # 1. Load PI0 base weights first (before LoRA renames keys)
+    # Load PI0 base weights (frozen backbone)
     safetensors.torch.load_model(
         model,
         os.path.join(PI05_CKPT_DIR, "model.safetensors"),
         strict=False,
     )
-    # 2. Apply LoRA (adds trainable A/B matrices, base weights stay frozen)
-    _apply_lora(model)
-    # 3. Gradient checkpointing to offset memory cost of LoRA backprop through prefix
-    model.paligemma_with_expert.paligemma.language_model.gradient_checkpointing_enable()
-    # 4. Compile only the goal expert (LoRA layers are too small to benefit from compile)
+    # Compile only the goal expert
     model.goal_expert = torch.compile(model.goal_expert)
-    print("  Model loaded (LoRA on PaliGemma LM + goal_expert compiled).")
+    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"  Model loaded (backbone fully frozen, {n_trainable/1e6:.1f}M trainable params).")
     return model
 
 
@@ -487,7 +461,7 @@ def train():
     start_step = 0
     if ckpt_path.exists():
         ckpt = torch.load(ckpt_path, map_location=device)
-        raw_model.load_state_dict(ckpt["model"])
+        raw_model.load_trainable_state(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         try:
             scheduler.load_state_dict(ckpt["scheduler"])
@@ -563,7 +537,7 @@ def train():
             if (step + 1) % SAVE_STEPS == 0 or step == MAX_STEPS - 1:
                 torch.save({
                     "step":      step,
-                    "model":     raw_model.state_dict(),
+                    "model":     raw_model.trainable_state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "scheduler": scheduler.state_dict(),
                 }, ckpt_path)

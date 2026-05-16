@@ -114,6 +114,7 @@ class PI0WithGoalExpert(PI0Pytorch):
         )
         self.goal_expert = GemmaForCausalLM(expert_hf_cfg).to(torch.bfloat16)
         self.goal_expert.model.embed_tokens = None
+        self.goal_expert.lm_head = None   # unused; saves ~263M trainable params
 
         # Timestep MLP for AdaRMS
         self.goal_time_mlp_in  = nn.Linear(W, W, dtype=torch.bfloat16)
@@ -169,6 +170,30 @@ class PI0WithGoalExpert(PI0Pytorch):
 
     def _unnormalize_action(self, a: torch.Tensor) -> torch.Tensor:
         return (a + 1.0) / 2.0 * (self.action_q99 - self.action_q01) + self.action_q01
+
+    # ------------------------------------------------------------------
+    # Checkpoint helpers (save/load only trainable + buffers, skip PI0 backbone)
+    # ------------------------------------------------------------------
+
+    def trainable_state_dict(self) -> dict:
+        """state_dict containing only trainable params + buffers (no frozen backbone)."""
+        full = self.state_dict()
+        keep = {n for n, p in self.named_parameters() if p.requires_grad}
+        keep |= {n for n, _ in self.named_buffers()}
+        return {k: v for k, v in full.items() if k in keep}
+
+    def load_trainable_state(self, state: dict) -> None:
+        """Load trainable params + buffers; frozen backbone must be loaded separately."""
+        missing, unexpected = self.load_state_dict(state, strict=False)
+        # OK to miss any non-trainable key (frozen params + tied weights).
+        trainable_names = {n for n, p in self.named_parameters() if p.requires_grad}
+        buffer_names    = {n for n, _ in self.named_buffers()}
+        expected_keys   = trainable_names | buffer_names
+        real_missing    = [k for k in missing if k in expected_keys]
+        if real_missing:
+            raise RuntimeError(f"Missing trainable keys: {real_missing[:5]}...")
+        if unexpected:
+            raise RuntimeError(f"Unexpected keys in ckpt: {unexpected[:5]}...")
 
     # ------------------------------------------------------------------
     # Prefix: current obs → KV cache

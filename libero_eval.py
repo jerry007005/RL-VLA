@@ -87,7 +87,6 @@ def _load_executor(ckpt_path: str, norm_stats_path: str) -> Executor:
 
 def _load_goal_expert(goal_ckpt: str, pi05_ckpt_dir: str) -> PI0WithGoalExpert:
     from openpi.training import config as _config
-    from peft import get_peft_model, LoraConfig
     import safetensors.torch
 
     train_cfg = _config.get_config("pi05_libero")
@@ -100,31 +99,14 @@ def _load_goal_expert(goal_ckpt: str, pi05_ckpt_dir: str) -> PI0WithGoalExpert:
         expert_variant="gemma_300m",
         norm_stats_path=ns_path,
     ).to(DEVICE)
-    # 1. Load PI0 base weights (before LoRA renames keys)
+    # Load PI0 base weights (frozen backbone)
     safetensors.torch.load_model(
         model, os.path.join(pi05_ckpt_dir, "model.safetensors"), strict=False,
     )
-    # 2. Apply LoRA with same config as training
-    lora_cfg = LoraConfig(
-        r=8, lora_alpha=16,
-        target_modules=["q_proj", "v_proj"],
-        lora_dropout=0.0,
-        bias="none",
-    )
-    model.paligemma_with_expert.paligemma.language_model = get_peft_model(
-        model.paligemma_with_expert.paligemma.language_model, lora_cfg,
-    )
-    # 3. Load trained weights (LoRA + goal expert), strip torch.compile prefix
+    # Load trained goal expert weights (strip torch.compile prefix)
     ckpt = torch.load(goal_ckpt, map_location=DEVICE)
     state = {k.replace("_orig_mod.", ""): v for k, v in ckpt["model"].items()}
-    missing, unexpected = model.load_state_dict(state, strict=False)
-    # action_q01/q99 loaded from norm_stats; horizon_head may not exist in older ckpts
-    expected_missing = {"action_q01", "action_q99", "horizon_head.weight", "horizon_head.bias"}
-    real_missing = [k for k in missing if k not in expected_missing]
-    if real_missing:
-        print(f"[Warning] Unexpected missing keys: {real_missing[:5]}")
-    if unexpected:
-        print(f"[Warning] Unexpected keys in ckpt: {unexpected[:5]}")
+    model.load_trainable_state(state)
     model.eval()
     print(f"GoalExpert loaded from {goal_ckpt} (step {ckpt.get('step','?')})")
     return model

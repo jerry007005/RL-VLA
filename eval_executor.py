@@ -72,7 +72,6 @@ def load_executor() -> Executor:
 
 def load_goal_expert() -> PI0WithGoalExpert:
     from openpi.training import config as _config
-    from peft import get_peft_model, LoraConfig
     import safetensors.torch
 
     train_cfg = _config.get_config("pi05_libero")
@@ -83,24 +82,14 @@ def load_goal_expert() -> PI0WithGoalExpert:
         norm_stats_path=NORM_STATS_PATH,
     ).to(DEVICE)
 
-    # 1. Load PI0 base weights (before LoRA renames keys)
+    # Load PI0 base weights (frozen backbone)
     safetensors.torch.load_model(
         model, os.path.join(PI05_CKPT_DIR, "model.safetensors"), strict=False,
     )
-    # 2. Apply LoRA with same config as training
-    lora_cfg = LoraConfig(
-        r=8, lora_alpha=16,
-        target_modules=["q_proj", "v_proj"],
-        lora_dropout=0.0,
-        bias="none",
-    )
-    model.paligemma_with_expert.paligemma.language_model = get_peft_model(
-        model.paligemma_with_expert.paligemma.language_model, lora_cfg,
-    )
-    # 3. Load trained weights (LoRA + goal expert, strip torch.compile prefix)
+    # Load trained goal expert weights (strip torch.compile prefix)
     ckpt = torch.load(GOAL_EXPERT_CKPT, map_location=DEVICE)
     state = {k.replace("_orig_mod.", ""): v for k, v in ckpt["model"].items()}
-    model.load_state_dict(state)
+    model.load_trainable_state(state)
     model.eval()
     step = ckpt.get("step", "?")
     print(f"GoalExpert loaded (step {step})")

@@ -52,7 +52,7 @@ class Args:
     task_suite_name:    str = "libero_spatial"
     num_steps_wait:     int = 10
     num_trials_per_task:int = 50
-    replan_tolerance:   int = 10     # extra steps added to horizon_pred before replanning
+    replan_tolerance:   int = 0     # extra steps added to horizon_pred before replanning
     resize_size:        int = 224
     max_lang_len:       int = 48
     seed:               int = 7
@@ -64,6 +64,8 @@ class Args:
     pi05_ckpt_dir:      str = "/mnt/nfs/Users/jerry007005/model/openpi/pi05_libero"
     save_video:         bool = True   # save per-episode MP4 to local_log_dir/videos/
     video_fps:          int  = 10
+    mode:               str  = "sample_all"   # "sample_action" | "sample_goal" | "sample_all"
+    action_chunk_replan: int = 5              # for sample_action: replan every N steps
 
 
 # ---------------------------------------------------------------------------
@@ -76,9 +78,16 @@ def _load_executor(ckpt_path: str) -> Executor:
         action_dim=ACTION_DIM, hidden_dim=HIDDEN_DIM, num_hidden_layers=NUM_LAYERS,
     ).to(DEVICE)
     ckpt = torch.load(ckpt_path, map_location=DEVICE)
-    model.load_state_dict(ckpt["model"])
+    model.load_state_dict(ckpt["model"], strict=False)
+    # Inject optional norm stats directly into model
+    msd = ckpt["model"]
+    for key in ("state_q01", "state_q99", "action_q01", "action_q99"):
+        if key in msd:
+            setattr(model, key, msd[key].to(DEVICE))
     model.eval()
-    print(f"Executor loaded from {ckpt_path} (step {ckpt.get('step','?')})")
+    has_norm = "state_q01" in msd
+    print(f"Executor loaded from {ckpt_path} (step {ckpt.get('step','?')})"
+          + (" [with norm stats]" if has_norm else ""))
     return model
 
 
@@ -88,10 +97,14 @@ def _load_goal_expert(goal_ckpt: str, pi05_ckpt_dir: str) -> PI0WithGoalExpert:
     import safetensors.torch
 
     train_cfg = _config.get_config("pi05_libero")
+    ns_path = str(
+        pathlib.Path(pi05_ckpt_dir) / "assets" / "physical-intelligence" / "libero" / "norm_stats.json"
+    )
     model = PI0WithGoalExpert(
         config=train_cfg.model, patch_dim=PATCH_DIM,
         proprio_dim=PROPRIO_DIM, freeze_pi0=True,
         expert_variant="gemma_300m",
+        norm_stats_path=ns_path,
     ).to(DEVICE)
     # 1. Load PI0 base weights (before LoRA renames keys)
     safetensors.torch.load_model(
@@ -110,7 +123,14 @@ def _load_goal_expert(goal_ckpt: str, pi05_ckpt_dir: str) -> PI0WithGoalExpert:
     # 3. Load trained weights (LoRA + goal expert), strip torch.compile prefix
     ckpt = torch.load(goal_ckpt, map_location=DEVICE)
     state = {k.replace("_orig_mod.", ""): v for k, v in ckpt["model"].items()}
-    model.load_state_dict(state)
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    # action_q01/q99 loaded from norm_stats; horizon_head may not exist in older ckpts
+    expected_missing = {"action_q01", "action_q99", "horizon_head.weight", "horizon_head.bias"}
+    real_missing = [k for k in missing if k not in expected_missing]
+    if real_missing:
+        print(f"[Warning] Unexpected missing keys: {real_missing[:5]}")
+    if unexpected:
+        print(f"[Warning] Unexpected keys in ckpt: {unexpected[:5]}")
     model.eval()
     print(f"GoalExpert loaded from {goal_ckpt} (step {ckpt.get('step','?')})")
     return model
@@ -223,11 +243,17 @@ def eval_libero(args: Args) -> None:
         raise ValueError(f"Unknown task suite: {args.task_suite_name}")
     max_steps = max_steps_map[args.task_suite_name]
 
+    if args.mode not in ("sample_action", "sample_goal", "sample_all"):
+        raise ValueError(f"Unknown mode: {args.mode}. Choose 'sample_action', 'sample_goal', or 'sample_all'.")
+
     # Load models
-    executor    = _load_executor(args.executor_ckpt)
+    need_executor = args.mode in ("sample_goal", "sample_all")
+    need_encoder  = args.mode in ("sample_goal", "sample_all")
+    executor    = _load_executor(args.executor_ckpt)   if need_executor else None
     goal_expert = _load_goal_expert(args.goal_expert_ckpt, args.pi05_ckpt_dir)
-    subgoal_enc = _load_subgoal_encoder(args.encoder_ckpt)
+    subgoal_enc = _load_subgoal_encoder(args.encoder_ckpt) if need_encoder  else None
     tokenizer   = _make_tokenizer(args.max_lang_len)
+    print(f"Eval mode: {args.mode}")
 
     # Task suite
     benchmark_dict = benchmark.get_benchmark_dict()
@@ -264,6 +290,7 @@ def eval_libero(args: Args) -> None:
             next_replan_in    = 1
             ep_replans        = 0
             sg_main = sg_wrist = sg_state = None   # current subgoal
+            vla_actions       = None               # action chunk from sample_all
             frames = []                            # for video recording
 
             while t < max_steps + args.num_steps_wait:
@@ -287,34 +314,56 @@ def eval_libero(args: Args) -> None:
                     wrist_t = _preprocess_img(raw_wrist, args.resize_size)
                     state_t = _get_state(obs)                                # (1, 8)
 
-                    # Encode current obs via SigLIP + SubgoalAutoencoder
-                    with torch.no_grad():
-                        curr_main, curr_wrist = _encode_obs(
-                            goal_expert, subgoal_enc, main_t, wrist_t
-                        )  # each (1, 2048) SAE latent
-                        curr_z = torch.cat([curr_main, curr_wrist], dim=-1)  # (1, 4096)
+                    # Encode current obs via SigLIP + SubgoalAutoencoder (not needed for sample_action)
+                    curr_main = curr_wrist = curr_z = None
+                    if need_encoder:
+                        with torch.no_grad():
+                            curr_main, curr_wrist = _encode_obs(
+                                goal_expert, subgoal_enc, main_t, wrist_t
+                            )  # each (1, 2048) SAE latent
+                            curr_z = torch.cat([curr_main, curr_wrist], dim=-1)  # (1, 4096)
 
-                    # Replan subgoal if needed
+                    # Replan if needed
                     if step_since_replan >= next_replan_in:
                         with torch.no_grad():
-                            sg_main, sg_wrist, sg_state, horizon_pred = goal_expert.sample_goal(
-                                main_t, wrist_t, lang_tokens, lang_mask, curr_z,
-                            )
-                        # Wait horizon_pred + tolerance steps before replanning
-                        h = int(horizon_pred.item()) if horizon_pred is not None else 0
-                        next_replan_in = h + args.replan_tolerance
+                            if args.mode == "sample_action":
+                                vla_actions = goal_expert.sample_action(
+                                    main_t, wrist_t, lang_tokens, lang_mask, state_t,
+                                )
+                                next_replan_in = args.action_chunk_replan
+                            elif args.mode == "sample_all":
+                                vla_actions, sg_main, sg_wrist, sg_state, horizon_pred = \
+                                    goal_expert.sample_all(
+                                        main_t, wrist_t, lang_tokens, lang_mask, curr_z, state_t,
+                                    )
+                                h = int(horizon_pred.item()) if horizon_pred is not None else 0
+                                next_replan_in = h + args.replan_tolerance
+                            else:  # sample_goal
+                                sg_main, sg_wrist, sg_state, horizon_pred = goal_expert.sample_goal(
+                                    main_t, wrist_t, lang_tokens, lang_mask, curr_z,
+                                )
+                                h = int(horizon_pred.item()) if horizon_pred is not None else 0
+                                next_replan_in = h + args.replan_tolerance
                         step_since_replan = 0
                         ep_replans += 1
 
-                    # Build Executor input
-                    imgs = torch.stack(
-                        [curr_main, curr_wrist, sg_main, sg_wrist], dim=1
-                    )  # (1, 4, 2048)
-
-                    with torch.no_grad():
-                        action, _, _ = executor(
-                            imgs, state_t, sg_state, deterministic=True
-                        )  # (1, 7)
+                    # Generate action
+                    if args.mode == "sample_action":
+                        # PI0.5 chunk only; clamp to last if somehow past end
+                        act_idx = min(step_since_replan, vla_actions.shape[1] - 1)
+                        action  = vla_actions[:, act_idx]
+                    elif args.mode == "sample_all" and step_since_replan < vla_actions.shape[1]:
+                        # Use PI0.5 action chunk while within horizon
+                        action  = vla_actions[:, step_since_replan]
+                    else:
+                        # sample_goal, or sample_all after chunk exhausted → executor
+                        imgs = torch.stack(
+                            [curr_main, curr_wrist, sg_main, sg_wrist], dim=1
+                        )  # (1, 4, 2048)
+                        with torch.no_grad():
+                            action, _, _ = executor(
+                                imgs, state_t, sg_state, deterministic=True
+                            )  # (1, 7)
 
                     # Step environment
                     obs, _, done, _ = env.step(action[0].cpu().tolist())

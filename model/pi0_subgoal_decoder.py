@@ -72,15 +72,33 @@ class PI0WithGoalExpert(PI0Pytorch):
     def __init__(
         self,
         config,
-        patch_dim:    int  = 2048,
-        proprio_dim:  int  = 8,
-        freeze_pi0:   bool = True,
-        expert_variant: str = "gemma_2b",
+        patch_dim:      int  = 2048,
+        proprio_dim:    int  = 8,
+        freeze_pi0:     bool = True,
+        expert_variant: str  = "gemma_2b",
+        norm_stats_path: str = None,
     ):
         super().__init__(config=config)
 
         self.patch_dim   = patch_dim
         self.proprio_dim = proprio_dim
+
+        # Action quantile norm stats: loaded once, moved with model via register_buffer
+        if norm_stats_path is not None:
+            import json as _json
+            _p = Path(norm_stats_path)
+            if _p.exists():
+                _ns = _json.loads(_p.read_text())["norm_stats"]["actions"]
+                self.register_buffer("action_q01", torch.tensor(_ns["q01"], dtype=torch.float32))
+                self.register_buffer("action_q99", torch.tensor(_ns["q99"], dtype=torch.float32))
+                print(f"[PI0WithGoalExpert] Loaded action norm_stats from {_p}")
+            else:
+                print(f"[PI0WithGoalExpert] Warning: norm_stats not found at {norm_stats_path}")
+                self.action_q01 = None
+                self.action_q99 = None
+        else:
+            self.action_q01 = None
+            self.action_q99 = None
 
         if freeze_pi0:
             for p in self.parameters():
@@ -121,17 +139,14 @@ class PI0WithGoalExpert(PI0Pytorch):
         self.sg_state_in_proj = nn.Linear(proprio_dim, W, dtype=torch.bfloat16)
 
         # Output projections (expert hidden → original dims, tokens 2/3/4 only).
-        # Visual heads use a 2-layer MLP with SiLU to break the rank bottleneck
-        # when W < patch_dim (e.g. gemma_300m: W=1024 < patch_dim=2048).
-        # A single Linear(W→patch_dim) has rank≤W, causing an MSE floor of W/patch_dim.
-        # The nonlinearity allows the second layer to span the full patch_dim space.
+        # 2-layer MLP with SiLU to break rank bottleneck when W < patch_dim.
         self.sg_main_out_proj  = nn.Sequential(
-            nn.Linear(W, patch_dim,   dtype=torch.bfloat16),
+            nn.Linear(W, patch_dim,         dtype=torch.bfloat16),
             nn.SiLU(),
             nn.Linear(patch_dim, patch_dim, dtype=torch.bfloat16),
         )
         self.sg_wrist_out_proj = nn.Sequential(
-            nn.Linear(W, patch_dim,   dtype=torch.bfloat16),
+            nn.Linear(W, patch_dim,         dtype=torch.bfloat16),
             nn.SiLU(),
             nn.Linear(patch_dim, patch_dim, dtype=torch.bfloat16),
         )
@@ -419,3 +434,109 @@ class PI0WithGoalExpert(PI0Pytorch):
         # x_main/x_wrist are deltas; recover absolute subgoal by adding curr.
         # horizon_pred is in steps (float), from the final denoising step.
         return curr_main + x_main, curr_wrist + x_wrist, x_state, horizon_pred
+
+    @torch.no_grad()
+    def sample_all(
+        self,
+        main_img:    torch.Tensor,   # (B, 3, H, W)
+        wrist_img:   torch.Tensor,   # (B, 3, H, W)
+        lang_tokens: torch.Tensor,   # (B, T) int64
+        lang_mask:   torch.Tensor,   # (B, T) bool
+        curr_z:      torch.Tensor,   # (B, 4096)
+        state:       torch.Tensor,   # (B, 8)
+        num_steps:   int = 10,
+    ) -> tuple:
+        """
+        Shared prefix KV: goal expert denoising + PI0.5 action denoising in one call.
+        Returns (actions, sg_main, sg_wrist, sg_state, horizon_pred)
+          actions: (B, action_horizon, action_dim) float32
+        """
+        B      = main_img.shape[0]
+        device = main_img.device
+
+        curr_main  = curr_z[:, :self.patch_dim].float()
+        curr_wrist = curr_z[:, self.patch_dim:].float()
+
+        # Build prefix KV once — shared for goal and action denoising
+        prefix_kv, prefix_pad = self._prefix_kv_cache(main_img, wrist_img, lang_tokens, lang_mask)
+
+        # ---- Goal expert denoising ----
+        x_main  = self._sample_noise((B, self.patch_dim),   device)
+        x_wrist = self._sample_noise((B, self.patch_dim),   device)
+        x_state = self._sample_noise((B, self.proprio_dim), device)
+
+        dt = torch.tensor(-1.0 / num_steps, dtype=torch.float32, device=device)
+        t  = torch.tensor(1.0,              dtype=torch.float32, device=device)
+
+        horizon_pred = None
+        while t >= -dt / 2:
+            v_main, v_wrist, v_state, horizon_pred = self._denoise_step(
+                x_main, x_wrist, x_state, curr_main, curr_wrist,
+                t.expand(B), prefix_kv, prefix_pad,
+            )
+            x_main  = x_main  + dt * v_main
+            x_wrist = x_wrist + dt * v_wrist
+            x_state = x_state + dt * v_state
+            t = t + dt
+
+        sg_main  = curr_main + x_main
+        sg_wrist = curr_wrist + x_wrist
+        sg_state = x_state
+
+        # ---- PI0.5 action denoising (reuses same prefix KV) ----
+        action_shape = (B, self.config.action_horizon, self.config.action_dim)
+        x_t = self.sample_noise(action_shape, device)
+
+        state_in = state.to(torch.bfloat16)
+        dt_a = torch.tensor(-1.0 / num_steps, dtype=torch.float32, device=device)
+        t_a  = torch.tensor(1.0,              dtype=torch.float32, device=device)
+
+        while t_a >= -dt_a / 2:
+            v_t = self.denoise_step(state_in, prefix_pad, prefix_kv, x_t, t_a.expand(B))
+            x_t = x_t + dt_a * v_t
+            t_a = t_a + dt_a
+
+        actions = x_t.float()
+        if self.action_q01 is not None:
+            env_dim = self.action_q01.shape[0]   # 7 for LIBERO; trim padding dims
+            actions = actions[:, :, :env_dim]
+            actions = (actions + 1.0) / 2.0 * (self.action_q99 - self.action_q01) + self.action_q01
+        return actions, sg_main, sg_wrist, sg_state, horizon_pred
+
+    @torch.no_grad()
+    def sample_action(
+        self,
+        main_img:    torch.Tensor,   # (B, 3, H, W)
+        wrist_img:   torch.Tensor,   # (B, 3, H, W)
+        lang_tokens: torch.Tensor,   # (B, T) int64
+        lang_mask:   torch.Tensor,   # (B, T) bool
+        state:       torch.Tensor,   # (B, 8)
+        num_steps:   int = 10,
+    ) -> torch.Tensor:
+        """
+        PI0.5 action denoising only — no goal expert, no executor.
+        Returns actions: (B, action_horizon, action_dim) float32
+        """
+        B      = main_img.shape[0]
+        device = main_img.device
+
+        prefix_kv, prefix_pad = self._prefix_kv_cache(main_img, wrist_img, lang_tokens, lang_mask)
+
+        action_shape = (B, self.config.action_horizon, self.config.action_dim)
+        x_t = self.sample_noise(action_shape, device)
+
+        state_in = state.to(torch.bfloat16)
+        dt = torch.tensor(-1.0 / num_steps, dtype=torch.float32, device=device)
+        t  = torch.tensor(1.0,              dtype=torch.float32, device=device)
+
+        while t >= -dt / 2:
+            v_t = self.denoise_step(state_in, prefix_pad, prefix_kv, x_t, t.expand(B))
+            x_t = x_t + dt * v_t
+            t = t + dt
+
+        actions = x_t.float()
+        if self.action_q01 is not None:
+            env_dim = self.action_q01.shape[0]   # 7 for LIBERO; trim padding dims
+            actions = actions[:, :, :env_dim]
+            actions = (actions + 1.0) / 2.0 * (self.action_q99 - self.action_q01) + self.action_q01
+        return actions

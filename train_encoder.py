@@ -39,6 +39,13 @@ from model.subgoal_encoder import SubgoalAutoencoder
 # ---------------------------------------------------------------------------
 
 SUBGOAL_CACHE_DIR = "/mnt/nfs/Users/jerry007005/dataset/subgoal_decoder_cache"
+RLDS_DATA_DIR     = "/mnt/nfs/Users/jerry007005/dataset/gripper_annotated_libero_rlds"
+DATASET_NAMES     = [
+    "libero_spatial_no_noops",
+    "libero_goal_no_noops",
+    "libero_object_no_noops",
+    "libero_10_no_noops",
+]
 PI05_CKPT_DIR     = "/mnt/nfs/Users/jerry007005/model/openpi/pi05_libero"
 CKPT_DIR          = "./checkpoints/subgoal_encoder"
 
@@ -56,6 +63,78 @@ SAVE_STEPS   = 2000
 
 WANDB_PROJECT  = "RL-VLA"
 WANDB_RUN_NAME = "subgoal-encoder"
+
+
+# ---------------------------------------------------------------------------
+# Phase 0: build image cache from RLDS
+# ---------------------------------------------------------------------------
+
+def _resize_img(img_uint8: np.ndarray) -> np.ndarray:
+    from openpi_client import image_tools
+    return image_tools.convert_to_uint8(
+        image_tools.resize_with_pad(img_uint8, IMG_SIZE, IMG_SIZE)
+    )
+
+
+def _make_tokenizer():
+    from openpi.models import tokenizer as _tok
+    return _tok.PaligemmaTokenizer(max_len=48)
+
+
+def build_cache():
+    """Read gripper_annotated RLDS, save full per-episode npz (images, lang, states, sg_frames)."""
+    import tensorflow as tf
+    tf.config.set_visible_devices([], "GPU")
+
+    cache_path = Path(SUBGOAL_CACHE_DIR)
+    index_file = cache_path / "index.json"
+    if index_file.exists():
+        print("Cache already exists, skipping Phase 0.")
+        return
+
+    cache_path.mkdir(parents=True, exist_ok=True)
+    print(f"Building cache from {RLDS_DATA_DIR} ...")
+
+    from convert_rlds_subgoal_2 import GripperAnnotatedLiberoDataset
+    tokenizer = _make_tokenizer()
+
+    index  = []
+    ep_idx = 0
+    for dataset_name in DATASET_NAMES:
+        print(f"  Processing {dataset_name} ...")
+        builder = GripperAnnotatedLiberoDataset(config=dataset_name, data_dir=RLDS_DATA_DIR)
+        ds = builder.as_dataset(split="train")
+
+        for episode in ds:
+            steps = list(episode["steps"].as_numpy_iterator())
+            n = len(steps)
+
+            lang_str = steps[0]["language_instruction"].decode()
+            lang_tokens, lang_mask = tokenizer.tokenize(lang_str, state=None)
+
+            main_imgs  = np.stack([_resize_img(s["observation"]["image"])       for s in steps])
+            wrist_imgs = np.stack([_resize_img(s["observation"]["wrist_image"]) for s in steps])
+            states     = np.stack([s["observation"]["state"].astype(np.float32) for s in steps])
+            sg_frames  = np.array([s["subgoal_frame"] for s in steps], dtype=np.int32)
+
+            ep_file = cache_path / f"ep_{ep_idx:04d}.npz"
+            np.savez_compressed(ep_file,
+                main_imgs   = main_imgs.astype(np.uint8),
+                wrist_imgs  = wrist_imgs.astype(np.uint8),
+                lang_tokens = lang_tokens.astype(np.int32),
+                lang_mask   = lang_mask.astype(bool),
+                states      = states,
+                sg_frames   = sg_frames,
+            )
+            index.append({"ep_idx": ep_idx, "n_steps": n, "file": ep_file.name,
+                          "dataset": dataset_name})
+
+            if ep_idx % 50 == 0:
+                print(f"  ep {ep_idx:4d}: {n} steps | {lang_str[:50]}")
+            ep_idx += 1
+
+    index_file.write_text(json.dumps(index, indent=2))
+    print(f"Phase 0 done. {ep_idx} episodes → {SUBGOAL_CACHE_DIR}")
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +217,8 @@ def _load_embed_fn():
 # ---------------------------------------------------------------------------
 
 def train():
+    build_cache()
+
     use_ddp = "LOCAL_RANK" in os.environ
     if use_ddp:
         local_rank = int(os.environ["LOCAL_RANK"])

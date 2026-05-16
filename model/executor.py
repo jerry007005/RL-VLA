@@ -51,6 +51,12 @@ class Executor(nn.Module):
         self.mlp = build_mlp(mlp_input_dim, hidden_dim, action_dim, num_hidden_layers)
         self.log_std = nn.Parameter(torch.full((action_dim,), log_std_init))
 
+        # Optional quantile norm stats — set after loading checkpoint if present
+        self.state_q01  = None
+        self.state_q99  = None
+        self.action_q01 = None
+        self.action_q99 = None
+
     def forward(
         self,
         imgs: torch.Tensor,            # (B, 4, patch_dim)
@@ -67,6 +73,10 @@ class Executor(nn.Module):
         B = imgs.shape[0]
         img_feat = imgs.reshape(B, -1)  # (B, 4*patch_dim)
 
+        # Normalize current state; subgoal_proprio comes from goal expert (already normalized)
+        if self.state_q01 is not None:
+            current_proprio = (current_proprio - self.state_q01) / (self.state_q99 - self.state_q01) * 2.0 - 1.0
+
         x = torch.cat([img_feat, current_proprio, subgoal_proprio], dim=-1)
         mean = self.mlp(x)  # (B, action_dim)
 
@@ -74,6 +84,10 @@ class Executor(nn.Module):
         dist = Normal(mean, std)
         action = mean if deterministic else dist.rsample()
         log_prob = dist.log_prob(action).sum(dim=-1)  # (B,)
+
+        # Unnormalize action output if norm stats are available
+        if self.action_q01 is not None:
+            action = (action + 1.0) / 2.0 * (self.action_q99 - self.action_q01) + self.action_q01
 
         return action, log_prob, dist
 

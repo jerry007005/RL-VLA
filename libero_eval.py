@@ -319,7 +319,7 @@ def eval_libero(args: Args) -> None:
                                 next_replan_in = h + args.replan_tolerance
                             else:  # sample_goal
                                 sg_main, sg_wrist, sg_state, horizon_pred = goal_expert.sample_goal(
-                                    main_t, wrist_t, lang_tokens, lang_mask, curr_z,
+                                    main_t, wrist_t, lang_tokens, lang_mask, curr_z, state_t,
                                 )
                                 h = int(horizon_pred.item()) if horizon_pred is not None else 0
                                 next_replan_in = h + args.replan_tolerance

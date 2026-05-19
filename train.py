@@ -30,9 +30,9 @@ from model.subgoal_encoder import SubgoalAutoencoder
 # Config
 # ---------------------------------------------------------------------------
 
-DST_DATA_DIR  = "/mnt/nfs/Users/jerry007005/dataset/annotated_libero_rlds"
+DST_DATA_DIR  = "/mnt/nfs/Users/jerry007005/dataset/gripper_annotated_libero_rlds"
 DATASET_NAME  = "libero_spatial_no_noops"
-CACHE_DIR          = "/mnt/nfs/Users/jerry007005/dataset/executor_feat_cache"
+CACHE_DIR          = f"/mnt/nfs/Users/jerry007005/dataset/executor_feat_cache/{DATASET_NAME}"
 CKPT_DIR           = "./checkpoints/executor"
 ENCODER_CKPT_PATH  = "./checkpoints/subgoal_encoder/checkpoint.pt"
 
@@ -41,7 +41,7 @@ NORM_STATS_PATH = os.path.join(
     PI05_CKPT_DIR, "assets", "physical-intelligence", "libero", "norm_stats.json"
 )
 IMG_SIZE      = 224
-PATCH_DIM     = 2048   # pi0.5 SigLIP projection dim
+PATCH_DIM     = 2048   # SigLIP patch dim (SAE input) AND per-slot SAE latent dim (output)
 N_PATCHES     = 512    # 256 main + 256 wrist
 
 PROPRIO_DIM   = 8
@@ -57,10 +57,13 @@ MAX_STEPS           = 1_000_000
 LOG_STEPS           = 100
 SAVE_STEPS          = 1_000
 
-# Subgoal noise augmentation: adds Gaussian noise to sg_main / sg_wrist embeddings
-# during training so the executor is robust to goal-expert generation errors.
-# Set to 0 to disable. Start with 0.1 and tune based on eval gap.
-SG_NOISE_STD = 0.1
+# Input augmentation stds (0 to disable each).
+# sg noise: robust to goal-expert generation errors
+# curr noise: robust to obs encoding drift between train/eval
+# state noise: robust to slight EEF state inaccuracies
+SG_NOISE_STD    = 0.1
+CURR_NOISE_STD  = 0.05
+STATE_NOISE_STD = 0.02
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -126,26 +129,48 @@ def _preprocess_images(imgs_uint8: np.ndarray) -> torch.Tensor:
     return torch.stack(out, dim=0)  # (N, 3, H, W)
 
 
+TEMPORAL_WINDOW = 5  # must match SubgoalAutoencoder.temporal_window
+
+
 @torch.no_grad()
-def _encode_frame_batch(
+def _encode_episode_temporal(
     backbone,
     subgoal_enc: SubgoalAutoencoder,
     main_imgs_uint8: list[np.ndarray],
     wrist_imgs_uint8: list[np.ndarray],
+    bs_backbone: int = 16,
+    bs_window:   int = 4,
 ) -> np.ndarray:
     """
-    Run frozen backbone + SubgoalAutoencoder on a batch of (main, wrist) frame pairs.
-    Returns (N, 4096) encoder latents z, where:
-      z[:, :2048]  → main  token
-      z[:, 2048:]  → wrist token
+    Encode all N frames with a ±T//2 temporal window (edge-clamped).
+    Returns z (N, latent_dim) — single scene token per frame.
     """
-    main_pixels  = _preprocess_images(np.stack(main_imgs_uint8)).to(DEVICE)
-    wrist_pixels = _preprocess_images(np.stack(wrist_imgs_uint8)).to(DEVICE)
-    main_patches  = backbone.embed_image(main_pixels).float()    # (N, 256, 2048)
-    wrist_patches = backbone.embed_image(wrist_pixels).float()   # (N, 256, 2048)
-    patches = torch.cat([main_patches, wrist_patches], dim=1)    # (N, 512, 2048)
-    z = subgoal_enc.encode(patches)                              # (N, 4096)
-    return z.cpu().numpy()
+    N    = len(main_imgs_uint8)
+    T    = TEMPORAL_WINDOW
+    half = T // 2
+
+    # Step 1: backbone embed_image on all N frames
+    main_pixels  = _preprocess_images(np.stack(main_imgs_uint8))
+    wrist_pixels = _preprocess_images(np.stack(wrist_imgs_uint8))
+    patch_chunks = []
+    for i in range(0, N, bs_backbone):
+        mp = backbone.embed_image(main_pixels[i:i+bs_backbone].to(DEVICE)).float()
+        wp = backbone.embed_image(wrist_pixels[i:i+bs_backbone].to(DEVICE)).float()
+        patch_chunks.append(torch.cat([mp, wp], dim=1).cpu())
+    all_patches = torch.cat(patch_chunks, dim=0)                   # (N, 512, 2048)
+
+    # Step 2: per-frame temporal window, batched
+    z_list = []
+    for i in range(0, N, bs_window):
+        cur  = min(bs_window, N - i)
+        idxs = torch.tensor(
+            [[max(0, min(N - 1, j + off)) for off in range(-half, half + 1)]
+             for j in range(i, i + cur)],
+            dtype=torch.long,
+        )                                                          # (cur, T)
+        windows = all_patches[idxs].to(DEVICE)                     # (cur, T, 512, 2048)
+        z_list.append(subgoal_enc.encode(windows).cpu().numpy())
+    return np.concatenate(z_list, axis=0).astype(np.float32)        # (N, latent_dim)
 
 
 def extract_features():
@@ -178,8 +203,10 @@ def extract_features():
     backbone    = _load_pi05_vision_encoder()
     subgoal_enc = _load_subgoal_encoder()
 
-    from convert_rlds_subgoal import AnnotatedLiberoDataset
-    builder = AnnotatedLiberoDataset(config=DATASET_NAME, data_dir=DST_DATA_DIR)
+    import tensorflow_datasets as tfds
+    ds_dir = (f"{DST_DATA_DIR}/gripper_annotated_libero_dataset/"
+              f"{DATASET_NAME}/1.0.0")
+    builder = tfds.builder_from_directory(ds_dir)
     ds = builder.as_dataset(split="train")
 
     index = []
@@ -195,15 +222,8 @@ def extract_features():
         actions    = np.array([s["action"]               for s in steps], dtype=np.float32)
         sg_frames  = np.array([int(s["subgoal_frame"])   for s in steps], dtype=np.int32)
 
-        z_list = []
-        for i in range(0, n, ENCODE_BATCH):
-            z_batch = _encode_frame_batch(
-                backbone, subgoal_enc,
-                main_imgs[i:i + ENCODE_BATCH],
-                wrist_imgs[i:i + ENCODE_BATCH],
-            )
-            z_list.append(z_batch)
-        z = np.concatenate(z_list, axis=0).astype(np.float32)  # (N, 4096)
+        # Single-token scene latents per frame, encoded with ±T//2 temporal window
+        z = _encode_episode_temporal(backbone, subgoal_enc, main_imgs, wrist_imgs)  # (N, latent_dim)
 
         ep_file = cache_path / f"ep_{ep_idx:04d}.npz"
         np.savez_compressed(ep_file,
@@ -249,13 +269,13 @@ class ExecutorDataset(IterableDataset):
             }
             for step_idx in range(entry["n_steps"]):
                 sg_idx   = int(ep["sg_frames"][step_idx])
-                z_curr   = ep["z"][step_idx]   # (4096,)
-                z_sg     = ep["z"][sg_idx]     # (4096,)
+                z_curr   = ep["z"][step_idx]   # (4096,) = 2 slots × 2048
+                z_sg     = ep["z"][sg_idx]
                 imgs = np.stack([
-                    z_curr[:PATCH_DIM],   # curr_main  encoder token
-                    z_curr[PATCH_DIM:],   # curr_wrist encoder token
-                    z_sg[:PATCH_DIM],     # sg_main    encoder token
-                    z_sg[PATCH_DIM:],     # sg_wrist   encoder token
+                    z_curr[:PATCH_DIM],   # curr_main
+                    z_curr[PATCH_DIM:],   # curr_wrist
+                    z_sg[:PATCH_DIM],     # sg_main
+                    z_sg[PATCH_DIM:],     # sg_wrist
                 ], axis=0)               # (4, 2048)
                 self.samples.append((
                     torch.from_numpy(imgs),
@@ -313,8 +333,8 @@ def train():
     )
 
     model = Executor(
-        num_imgs          = 4,
-        patch_dim         = PATCH_DIM,
+        num_imgs          = 4,            # curr_main, curr_wrist, sg_main, sg_wrist
+        patch_dim         = PATCH_DIM,    # 2048
         proprio_dim       = PROPRIO_DIM,
         action_dim        = ACTION_DIM,
         hidden_dim        = HIDDEN_DIM,
@@ -350,9 +370,14 @@ def train():
         sg_state   = sg_state.to(DEVICE)
         actions    = actions.to(DEVICE)
 
+        # imgs shape: (B, 4, PATCH_DIM) — [curr_main, curr_wrist, sg_main, sg_wrist]
+        if CURR_NOISE_STD > 0:
+            imgs[:, :2] = imgs[:, :2] + torch.randn_like(imgs[:, :2]) * CURR_NOISE_STD
         if SG_NOISE_STD > 0:
-            imgs[:, 2] = imgs[:, 2] + torch.randn_like(imgs[:, 2]) * SG_NOISE_STD
-            imgs[:, 3] = imgs[:, 3] + torch.randn_like(imgs[:, 3]) * SG_NOISE_STD
+            imgs[:, 2:] = imgs[:, 2:] + torch.randn_like(imgs[:, 2:]) * SG_NOISE_STD
+        if STATE_NOISE_STD > 0:
+            curr_state = curr_state + torch.randn_like(curr_state) * STATE_NOISE_STD
+            sg_state   = sg_state   + torch.randn_like(sg_state)   * STATE_NOISE_STD
 
         optimizer.zero_grad()
         loss, info = model.compute_bc_loss(imgs, curr_state, sg_state, actions)

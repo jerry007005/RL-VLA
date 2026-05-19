@@ -92,11 +92,15 @@ def _load_pi05_backbone():
     return backbone
 
 
+TEMPORAL_WINDOW = 5  # must match the temporal_window used to train SubgoalAutoencoder
+
+
 def _load_subgoal_encoder_for_phase05():
     from model.subgoal_encoder import SubgoalAutoencoder
     ae = SubgoalAutoencoder(
         patch_dim=PATCH_DIM, n_queries=2, n_patches=512,
         n_heads=16, enc_layers=2, dec_layers=2, ffn_mult=4,
+        temporal_window=TEMPORAL_WINDOW, temporal_layers=2,
     )
     ckpt = torch.load(ENCODER_CKPT_PATH, map_location=DEVICE, weights_only=False)
     ae.load_state_dict(ckpt["model"])
@@ -108,9 +112,11 @@ def _load_subgoal_encoder_for_phase05():
 
 
 @torch.no_grad()
-def _encode_frames(backbone, encoder, main_imgs_uint8, wrist_imgs_uint8, bs=16):
+def _encode_frames(backbone, encoder, main_imgs_uint8, wrist_imgs_uint8,
+                   bs_backbone=16, bs_window=4):
     """
-    (N, H, W, 3) uint8 arrays → z (N, 4096) float32 via backbone + encoder.
+    (N, H, W, 3) uint8 arrays → z (N, 4096) float32.
+    Each frame is encoded with a ±T//2 temporal window (edge-clamped).
     """
     from openpi_client import image_tools
 
@@ -125,13 +131,29 @@ def _encode_frames(backbone, encoder, main_imgs_uint8, wrist_imgs_uint8, bs=16):
         return torch.stack(out).to(DEVICE)
 
     N = len(main_imgs_uint8)
+    T = TEMPORAL_WINDOW
+    half = T // 2
+
+    # Step 1: embed all N frames once via backbone
+    patch_chunks = []
+    for i in range(0, N, bs_backbone):
+        mp = backbone.embed_image(_prep(main_imgs_uint8[i:i+bs_backbone])).float()
+        wp = backbone.embed_image(_prep(wrist_imgs_uint8[i:i+bs_backbone])).float()
+        patch_chunks.append(torch.cat([mp, wp], dim=1).cpu())                # (B, 512, 2048)
+    all_patches = torch.cat(patch_chunks, dim=0)                              # (N, 512, 2048)
+
+    # Step 2: build per-frame temporal window, batched
     z_list = []
-    for i in range(0, N, bs):
-        mp = backbone.embed_image(_prep(main_imgs_uint8[i:i+bs])).float()   # (B,256,2048)
-        wp = backbone.embed_image(_prep(wrist_imgs_uint8[i:i+bs])).float()  # (B,256,2048)
-        patches = torch.cat([mp, wp], dim=1)                                # (B,512,2048)
-        z_list.append(encoder.encode(patches).cpu().numpy())
-    return np.concatenate(z_list, axis=0).astype(np.float32)                # (N,4096)
+    for i in range(0, N, bs_window):
+        cur = min(bs_window, N - i)
+        idxs = torch.tensor(
+            [[max(0, min(N - 1, j + off)) for off in range(-half, half + 1)]
+             for j in range(i, i + cur)],
+            dtype=torch.long,
+        )                                                                     # (cur, T)
+        windows = all_patches[idxs].to(DEVICE)                                # (cur, T, 512, 2048)
+        z_list.append(encoder.encode(windows).cpu().numpy())
+    return np.concatenate(z_list, axis=0).astype(np.float32)                  # (N, 4096)
 
 
 def extract_sg_encoder_latents():
@@ -139,18 +161,13 @@ def extract_sg_encoder_latents():
     Phase 0.5: compute SubgoalAutoencoder latents for every frame of every episode.
 
     Reads:
-      subgoal_decoder_cache  — raw images (main_imgs, wrist_imgs)
-      executor_feat_cache    — states, sg_frames  (old format OK)
+      subgoal_decoder_cache  — raw images + states + sg_frames + lang
 
     Writes to sg_encoder_cache per episode:
-      z         : (N, 4096)  encoder latent (main+wrist)
+      z         : (N, latent_dim)  encoder latent (single scene token)
       states    : (N, 8)
       sg_frames : (N,)
     """
-    # executor_feat_cache (old format) is only needed here to bootstrap
-    # states and sg_frames; not used anywhere else in this script.
-    _FEAT_CACHE = "/mnt/nfs/Users/jerry007005/dataset/executor_feat_cache"
-
     out_path = Path(SG_ENCODER_CACHE_DIR)
     out_path.mkdir(parents=True, exist_ok=True)
     index_file = out_path / "index.json"
@@ -159,12 +176,8 @@ def extract_sg_encoder_latents():
         print("Phase 0.5 cache already exists, skipping.")
         return
 
-    sg_path   = Path(SUBGOAL_CACHE_DIR)
-    feat_path = Path(_FEAT_CACHE)
-
-    sg_index   = json.loads((sg_path   / "index.json").read_text())
-    feat_index = json.loads((feat_path / "index.json").read_text())
-    feat_map   = {e["ep_idx"]: e for e in feat_index}
+    sg_path  = Path(SUBGOAL_CACHE_DIR)
+    sg_index = json.loads((sg_path / "index.json").read_text())
 
     backbone = _load_pi05_backbone()
     encoder  = _load_subgoal_encoder_for_phase05()
@@ -172,23 +185,19 @@ def extract_sg_encoder_latents():
     out_index = []
     for ep_entry in sg_index:
         ep_idx = ep_entry["ep_idx"]
-        if ep_idx not in feat_map:
-            continue
 
-        sg_data   = np.load(sg_path   / ep_entry["file"])
-        feat_data = np.load(feat_path / feat_map[ep_idx]["file"])
-
+        sg_data    = np.load(sg_path / ep_entry["file"])
         main_imgs  = sg_data["main_imgs"]    # (N, 224, 224, 3)
         wrist_imgs = sg_data["wrist_imgs"]
 
         z = _encode_frames(backbone, encoder,
-                           list(main_imgs), list(wrist_imgs))  # (N, 4096)
+                           list(main_imgs), list(wrist_imgs))  # (N, latent_dim)
 
         ep_file = out_path / f"ep_{ep_idx:04d}.npz"
         np.savez_compressed(ep_file,
             z         = z,
-            states    = feat_data["states"].astype(np.float32),
-            sg_frames = feat_data["sg_frames"].astype(np.int32),
+            states    = sg_data["states"].astype(np.float32),
+            sg_frames = sg_data["sg_frames"].astype(np.int32),
         )
         out_index.append({"ep_idx": ep_idx, "n_steps": ep_entry["n_steps"],
                           "file": ep_file.name})
@@ -340,8 +349,8 @@ class GoalExpertDataset(IterableDataset):
 
             for step_idx in step_order:
                 sg_idx  = int(ep["sg_frames"][step_idx])
-                z_curr  = ep["z"][step_idx]        # (4096,)
-                z_sg    = ep["z"][sg_idx]          # (4096,)
+                z_curr  = ep["z"][step_idx]        # (4096,) = 2 slots × 2048
+                z_sg    = ep["z"][sg_idx]
                 yield (
                     _img_to_chw(main_imgs[step_idx]),                   # (3, H, W)
                     _img_to_chw(wrist_imgs[step_idx]),                  # (3, H, W)
@@ -349,10 +358,11 @@ class GoalExpertDataset(IterableDataset):
                     ep["lang_mask"],                                     # (T,)
                     torch.from_numpy(z_curr[:PATCH_DIM].copy()),        # (2048,) curr_main
                     torch.from_numpy(z_curr[PATCH_DIM:].copy()),        # (2048,) curr_wrist
+                    torch.from_numpy(ep["states"][step_idx].copy()),    # (8,)    curr_state
                     torch.from_numpy(z_sg[:PATCH_DIM].copy()),          # (2048,) sg_main
                     torch.from_numpy(z_sg[PATCH_DIM:].copy()),          # (2048,) sg_wrist
-                    torch.from_numpy(ep["states"][sg_idx].copy()),      # (8,)
-                    torch.tensor(sg_idx - step_idx, dtype=torch.float32),  # () horizon
+                    torch.from_numpy(ep["states"][sg_idx].copy()),      # (8,)    sg_state
+                    torch.tensor(sg_idx - step_idx, dtype=torch.float32),  # ()  horizon
                 )
 
 
@@ -488,13 +498,15 @@ def train():
     for step in pbar:
         batch = next(data_iter)
         main_img, wrist_img, lang_tokens, lang_mask, \
-            curr_main, curr_wrist, sg_main, sg_wrist, sg_state, horizon = [
+            curr_main, curr_wrist, curr_state, \
+            sg_main, sg_wrist, sg_state, horizon = [
             x.to(device) for x in batch
         ]
 
         optimizer.zero_grad()
         loss, info = model(main_img, wrist_img, lang_tokens, lang_mask,
-                           curr_main, curr_wrist, sg_main, sg_wrist, sg_state,
+                           curr_main, curr_wrist, curr_state,
+                           sg_main, sg_wrist, sg_state,
                            horizon=horizon)
         loss.backward()
         nn.utils.clip_grad_norm_(trainable, 1.0)

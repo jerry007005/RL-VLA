@@ -53,13 +53,16 @@ IMG_SIZE   = 224
 PATCH_DIM  = 2048
 N_PATCHES  = 512   # 256 main + 256 wrist
 
-BATCH_SIZE   = 32
+BATCH_SIZE   = 16  # reduced from 32 because each sample is now T frames
 LR           = 3e-4
 WEIGHT_DECAY = 1e-4
 WARMUP_STEPS = 500
 MAX_STEPS    = 30000
 LOG_STEPS    = 100
 SAVE_STEPS   = 2000
+
+TEMPORAL_WINDOW = 5
+TEMPORAL_LAYERS = 2
 
 WANDB_PROJECT  = "RL-VLA"
 WANDB_RUN_NAME = "subgoal-encoder"
@@ -149,14 +152,16 @@ def _img_to_chw(img_uint8: np.ndarray) -> torch.Tensor:
 
 class PatchImageDataset(IterableDataset):
     """
-    Yields (main_chw, wrist_chw) for every frame in every episode.
-    Uses a per-worker image cache to avoid repeated NFS reads.
+    Yields (main_window, wrist_window) each shape (T, 3, H, W) — T frames centered on a random step.
+    Edge frames use repeat-padding (clamp to episode bounds).
     """
 
-    def __init__(self, cache_dir: str):
+    def __init__(self, cache_dir: str, temporal_window: int = 5):
         index = json.loads((Path(cache_dir) / "index.json").read_text())
-        self.episodes  = index
-        self.cache_dir = cache_dir
+        self.episodes        = index
+        self.cache_dir       = cache_dir
+        self.T               = temporal_window
+        self.half            = temporal_window // 2
 
     def __iter__(self):
         img_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
@@ -176,11 +181,16 @@ class PatchImageDataset(IterableDataset):
                     continue
 
             main_imgs, wrist_imgs = img_cache[idx]
-            step_order = list(range(ep["n_steps"]))
+            n_steps = ep["n_steps"]
+            step_order = list(range(n_steps))
             random.shuffle(step_order)
 
             for t in step_order:
-                yield _img_to_chw(main_imgs[t]), _img_to_chw(wrist_imgs[t])
+                idxs = [max(0, min(n_steps - 1, t + off))
+                        for off in range(-self.half, self.half + 1)]
+                main_window  = torch.stack([_img_to_chw(main_imgs[i])  for i in idxs])  # (T, 3, H, W)
+                wrist_window = torch.stack([_img_to_chw(wrist_imgs[i]) for i in idxs])
+                yield main_window, wrist_window
 
 
 # ---------------------------------------------------------------------------
@@ -254,7 +264,7 @@ def train():
     random.seed(42 + rank)
 
     # ---- data ----
-    dataset = PatchImageDataset(SUBGOAL_CACHE_DIR)
+    dataset = PatchImageDataset(SUBGOAL_CACHE_DIR, temporal_window=TEMPORAL_WINDOW)
     loader  = DataLoader(dataset, batch_size=BATCH_SIZE, num_workers=4,
                          pin_memory=True, persistent_workers=True, prefetch_factor=2)
 
@@ -263,13 +273,15 @@ def train():
 
     # ---- autoencoder (trainable) ----
     ae = SubgoalAutoencoder(
-        patch_dim  = PATCH_DIM,
-        n_queries  = 2,
-        n_patches  = N_PATCHES,
-        n_heads    = 16,
-        enc_layers = 2,
-        dec_layers = 2,
-        ffn_mult   = 4,
+        patch_dim        = PATCH_DIM,
+        n_queries        = 2,
+        n_patches        = N_PATCHES,
+        n_heads          = 16,
+        enc_layers       = 2,
+        dec_layers       = 2,
+        ffn_mult         = 4,
+        temporal_window  = TEMPORAL_WINDOW,
+        temporal_layers  = TEMPORAL_LAYERS,
     ).to(device)
 
     if use_ddp:
@@ -316,15 +328,19 @@ def train():
 
     for step in pbar:
         main_img, wrist_img = next(data_iter)
-        main_img  = main_img.to(device,  non_blocking=True)   # (B, 3, 224, 224)
+        main_img  = main_img.to(device,  non_blocking=True)   # (B, T, 3, 224, 224)
         wrist_img = wrist_img.to(device, non_blocking=True)
+        B, T = main_img.shape[:2]
 
         # embed_image: frozen backbone, no grad, output bfloat16
         with torch.no_grad():
-            main_patches  = backbone.paligemma_with_expert.embed_image(main_img).float()   # (B, 256, 2048)
-            wrist_patches = backbone.paligemma_with_expert.embed_image(wrist_img).float()  # (B, 256, 2048)
+            main_patches  = backbone.paligemma_with_expert.embed_image(
+                main_img.reshape(B * T, 3, IMG_SIZE, IMG_SIZE)).float()    # (B*T, 256, 2048)
+            wrist_patches = backbone.paligemma_with_expert.embed_image(
+                wrist_img.reshape(B * T, 3, IMG_SIZE, IMG_SIZE)).float()
 
-        patches = torch.cat([main_patches, wrist_patches], dim=1)   # (B, 512, 2048)
+        patches = torch.cat([main_patches, wrist_patches], dim=1)          # (B*T, 512, 2048)
+        patches = patches.reshape(B, T, N_PATCHES, PATCH_DIM)              # (B, T, 512, 2048)
 
         optimizer.zero_grad()
         z, recon, loss = ae(patches)
@@ -338,11 +354,12 @@ def train():
             pbar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{lr:.2e}")
 
             if (step + 1) % LOG_STEPS == 0:
-                # cosine similarity between original and reconstructed patches (batch mean)
+                # cosine similarity between center-frame original and reconstructed patches
                 with torch.no_grad():
+                    center_patches = patches[:, T // 2]                # (B, 512, 2048)
                     cos_sim = torch.nn.functional.cosine_similarity(
                         recon.reshape(-1, PATCH_DIM),
-                        patches.reshape(-1, PATCH_DIM),
+                        center_patches.reshape(-1, PATCH_DIM),
                         dim=-1
                     ).mean().item()
                 print(

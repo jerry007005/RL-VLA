@@ -24,10 +24,12 @@ from torch.distributions import Normal
 from typing import Tuple
 
 
-def build_mlp(input_dim, hidden_dim, output_dim, num_hidden_layers) -> nn.Sequential:
+def build_mlp(input_dim, hidden_dim, output_dim, num_hidden_layers, dropout: float = 0.0) -> nn.Sequential:
     layers, in_dim = [], input_dim
     for _ in range(num_hidden_layers):
         layers += [nn.Linear(in_dim, hidden_dim), nn.ReLU()]
+        if dropout > 0:
+            layers.append(nn.Dropout(dropout))
         in_dim = hidden_dim
     layers.append(nn.Linear(in_dim, output_dim))
     return nn.Sequential(*layers)
@@ -39,19 +41,20 @@ class Executor(nn.Module):
     def __init__(
         self,
         num_imgs: int = 4,           # curr_main, curr_wrist, sg_main, sg_wrist
-        patch_dim: int = 2048,       # pi0.5 SigLIP projection dim
+        patch_dim: int = 2048,       # SAE slot latent dim
         proprio_dim: int = 8,        # EEF state dim (same for current & subgoal)
         action_dim: int = 7,
         hidden_dim: int = 512,
         num_hidden_layers: int = 5,
         log_std_init: float = -2.0,
         norm_stats_path: str = None,  # pi0.5 norm_stats.json
+        dropout: float = 0.1,
     ):
         super().__init__()
         self.action_dim = action_dim
 
         mlp_input_dim = num_imgs * patch_dim + 2 * proprio_dim
-        self.mlp = build_mlp(mlp_input_dim, hidden_dim, action_dim, num_hidden_layers)
+        self.mlp = build_mlp(mlp_input_dim, hidden_dim, action_dim, num_hidden_layers, dropout=dropout)
         self.log_std = nn.Parameter(torch.full((action_dim,), log_std_init))
 
         # Action quantile norm stats from pi0.5 (required).

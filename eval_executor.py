@@ -28,18 +28,18 @@ from model.pi0_subgoal_decoder import PI0WithGoalExpert
 # Config (match train.py / train_subgoal_decoder.py)
 # ---------------------------------------------------------------------------
 
-FEAT_CACHE_DIR    = "/mnt/nfs/Users/jerry007005/dataset/executor_feat_cache/libero_10_no_noops"
+FEAT_CACHE_DIR    = "/mnt/nfs/Users/jerry007005/dataset/executor_feat_cache/libero_spatial_no_noops"
 SUBGOAL_CACHE_DIR = "/mnt/nfs/Users/jerry007005/dataset/subgoal_decoder_cache"
 SG_ENC_CACHE_DIR  = "/mnt/nfs/Users/jerry007005/dataset/sg_encoder_cache"
 
-EXECUTOR_CKPT   = "./checkpoints/v3/executor/checkpoint.pt"
-GOAL_EXPERT_CKPT = "./checkpoints/v3/goal_expert/checkpoint.pt"
+EXECUTOR_CKPT   = "./checkpoints/executor/checkpoint.pt"
+GOAL_EXPERT_CKPT = "./checkpoints/subgoal_decoder/checkpoint.pt"
 PI05_CKPT_DIR   = "/mnt/nfs/Users/jerry007005/model/openpi/pi05_libero"
 NORM_STATS_PATH = os.path.join(
     PI05_CKPT_DIR, "assets", "physical-intelligence", "libero", "norm_stats.json"
 )
 
-PATCH_DIM   = 2048
+PATCH_DIM   = 2048  # SigLIP patch dim AND per-slot SAE latent dim
 PROPRIO_DIM = 8
 ACTION_DIM  = 7
 HIDDEN_DIM  = 512
@@ -193,7 +193,7 @@ def eval_gt(executor: Executor, episodes: list) -> dict:
                 sg_state[sl].to(DEVICE),
                 deterministic=True,
             )
-            l1 = F.l1_loss(pred, actions[sl].to(DEVICE), reduction="none")  # (B, 7)
+            l1 = F.l1_loss(pred, actions[sl].to(DEVICE), reduction="none")
             l1_ep.append(l1.cpu())
 
         l1_ep = torch.cat(l1_ep, dim=0)  # (N, 7)
@@ -228,34 +228,32 @@ def eval_generated(executor: Executor, goal_expert: PI0WithGoalExpert,
         curr_state = torch.from_numpy(ep["states"])
         actions    = torch.from_numpy(ep["actions"])
 
-        # Generate subgoals in batches (PaliGemma is expensive)
         sg_main_list, sg_wrist_list, sg_state_list = [], [], []
-        lang_tok  = ep["lang_tokens"].unsqueeze(0)  # (1, T) → broadcast
+        lang_tok  = ep["lang_tokens"].unsqueeze(0)
         lang_mask = ep["lang_mask"].unsqueeze(0)
 
         for i in range(0, N, GOAL_BATCH):
             sl   = slice(i, i + GOAL_BATCH)
             B    = min(GOAL_BATCH, N - i)
-            imgs = _img_to_chw(ep["main_imgs"][sl]).to(DEVICE)    # (B, 3, H, W)
+            imgs = _img_to_chw(ep["main_imgs"][sl]).to(DEVICE)
             wrist= _img_to_chw(ep["wrist_imgs"][sl]).to(DEVICE)
             curr_z = torch.from_numpy(z[sl]).to(DEVICE)           # (B, 4096)
 
             sg_m, sg_w, sg_s, _ = goal_expert.sample_goal(
-                imgs,
-                wrist,
+                imgs, wrist,
                 lang_tok.expand(B, -1).to(DEVICE),
                 lang_mask.expand(B, -1).to(DEVICE),
                 curr_z,
+                curr_state[sl].to(DEVICE),
             )
             sg_main_list.append(sg_m.cpu())
             sg_wrist_list.append(sg_w.cpu())
             sg_state_list.append(sg_s.cpu())
 
-        sg_main  = torch.cat(sg_main_list,  dim=0)  # (N, 2048)
+        sg_main  = torch.cat(sg_main_list,  dim=0)
         sg_wrist = torch.cat(sg_wrist_list, dim=0)
-        sg_state = torch.cat(sg_state_list, dim=0)  # (N, 8)
+        sg_state = torch.cat(sg_state_list, dim=0)
 
-        # Executor forward with generated subgoal
         l1_ep = []
         for i in range(0, N, EVAL_BATCH):
             sl = slice(i, i + EVAL_BATCH)
@@ -268,7 +266,7 @@ def eval_generated(executor: Executor, goal_expert: PI0WithGoalExpert,
                 sg_state[sl].to(DEVICE),
                 deterministic=True,
             )
-            l1 = F.l1_loss(pred, actions[sl].to(DEVICE), reduction="none")  # (B, 7)
+            l1 = F.l1_loss(pred, actions[sl].to(DEVICE), reduction="none")
             l1_ep.append(l1.cpu())
 
         l1_ep = torch.cat(l1_ep, dim=0)  # (N, 7)
@@ -296,8 +294,8 @@ def eval_gen_img_gt_state(executor: Executor, goal_expert: PI0WithGoalExpert,
         if ep.get("main_imgs") is None:
             continue
 
-        N         = ep["n_steps"]
-        z         = ep["z"]
+        N          = ep["n_steps"]
+        z          = ep["z"]
         curr_main  = torch.from_numpy(z[:, :PATCH_DIM])
         curr_wrist = torch.from_numpy(z[:, PATCH_DIM:])
         curr_state = torch.from_numpy(ep["states"])
@@ -319,6 +317,7 @@ def eval_gen_img_gt_state(executor: Executor, goal_expert: PI0WithGoalExpert,
                 lang_tok.expand(B, -1).to(DEVICE),
                 lang_mask.expand(B, -1).to(DEVICE),
                 torch.from_numpy(z[sl]).to(DEVICE),
+                curr_state[sl].to(DEVICE),
             )
             sg_main_list.append(sg_m.cpu())
             sg_wrist_list.append(sg_w.cpu())
@@ -385,6 +384,7 @@ def eval_gt_img_gen_state(executor: Executor, goal_expert: PI0WithGoalExpert,
                 lang_tok.expand(B, -1).to(DEVICE),
                 lang_mask.expand(B, -1).to(DEVICE),
                 torch.from_numpy(z[sl]).to(DEVICE),
+                curr_state[sl].to(DEVICE),
             )
             sg_state_list.append(sg_s.cpu())
 
@@ -423,7 +423,7 @@ def eval_black(executor: Executor, episodes: list) -> dict:
     for ep in tqdm(episodes, desc="Test 5 (black subgoal)"):
         N = ep["n_steps"]
 
-        z          = ep["z"]                               # (N, 4096)
+        z          = ep["z"]                                # (N, 4096)
         curr_main  = torch.from_numpy(z[:, :PATCH_DIM])
         curr_wrist = torch.from_numpy(z[:, PATCH_DIM:])
         curr_state = torch.from_numpy(ep["states"])

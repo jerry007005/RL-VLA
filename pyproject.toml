@@ -1,0 +1,60 @@
+[project]
+name = "rl-vla"
+version = "0.1.0"
+description = "Hierarchical VLA: SubgoalAutoencoder + GoalExpert + Executor on LIBERO/pi0.5"
+requires-python = ">=3.11,<3.13"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Haochuan Xu" }]
+
+dependencies = [
+    # ── Vendored sub-projects ────────────────────────────────────────────────
+    "openpi",
+    "openpi-client",
+    "libero",
+
+    # ── Core ML ──────────────────────────────────────────────────────────────
+    "torch==2.7.1",
+    "torchvision>=0.22.0",
+    "transformers>=4.53.0",
+    "safetensors>=0.7.0",
+    "sentencepiece>=0.2.0",
+
+    # ── Numerics / vision ────────────────────────────────────────────────────
+    "numpy>=1.22.4,<2.0.0",
+    "pillow>=11.0.0",
+    "imageio[ffmpeg]>=2.36.0",
+    "matplotlib>=3.10.0",
+    "opencv-python>=4.10.0",
+
+    # ── TF / dataset loaders ─────────────────────────────────────────────────
+    "tensorflow==2.15.1",
+    "tensorflow-datasets>=4.9.3",
+
+    # ── Training infra ───────────────────────────────────────────────────────
+    "wandb>=0.26.0",
+    "draccus>=0.10.0",
+    "tqdm>=4.67.0",
+
+    # ── LIBERO transitive deps (LIBERO's setup.py declares install_requires=[]) ─
+    "robosuite==1.4.1",
+    "bddl>=3.6.0",
+    "easydict>=1.13",
+    "cloudpickle>=3.1.0",
+    "gym>=0.26.2",
+]
+
+[tool.uv.sources]
+openpi = { git = "https://github.com/Physical-Intelligence/openpi", rev = "650c5b0" }
+openpi-client = { git = "https://github.com/Physical-Intelligence/openpi", subdirectory = "packages/openpi-client", rev = "650c5b0" }
+libero = { git = "https://github.com/Lifelong-Robot-Learning/LIBERO", rev = "8f1084e" }
+
+# Match openpi's pinned overrides so resolution stays consistent across the workspace
+[tool.uv]
+override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["model"]

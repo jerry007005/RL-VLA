@@ -1,13 +1,15 @@
 """
-Subgoal-conditioned Actor Network.
+Subgoal-conditioned Actor Network (multi-slot, S slots per view).
 
 Inputs (all pre-encoded / numpy features — no vision encoder inside):
-  imgs           : (B, 4, patch_dim)  encoder latent features laid out as:
-                     [0] curr_main   — SubgoalAutoencoder latent z_curr[:, :patch_dim]
-                     [1] curr_wrist  — SubgoalAutoencoder latent z_curr[:, patch_dim:]
-                     [2] sg_main     — SubgoalAutoencoder latent z_sg[:, :patch_dim]
-                     [3] sg_wrist    — SubgoalAutoencoder latent z_sg[:, patch_dim:]
-                   All 4 slots come from SubgoalAutoencoder.encode(concat(main, wrist patches)).
+  imgs           : (B, 4*S, patch_dim)  encoder latent tokens laid out as:
+                     [0     .. S-1]     curr_main slots
+                     [S     .. 2S-1]    curr_wrist slots
+                     [2S    .. 3S-1]    sg_main slots
+                     [3S    .. 4S-1]    sg_wrist slots
+                   For S=8 this is 32 tokens total.
+                   Slots come from SubgoalAutoencoder.split_z (curr) and goal expert
+                   sample_goal (sg).
   current_proprio: (B, proprio_dim)   current EEF state
   subgoal_proprio: (B, proprio_dim)   subgoal EEF state
 
@@ -40,11 +42,11 @@ class Executor(nn.Module):
 
     def __init__(
         self,
-        num_imgs: int = 4,           # curr_main, curr_wrist, sg_main, sg_wrist
+        num_imgs: int = 32,          # 4 * slots_per_view (S=8 default)
         patch_dim: int = 2048,       # SAE slot latent dim
         proprio_dim: int = 8,        # EEF state dim (same for current & subgoal)
         action_dim: int = 7,
-        hidden_dim: int = 512,
+        hidden_dim: int = 1024,      # bumped from 512 to absorb larger input
         num_hidden_layers: int = 5,
         log_std_init: float = -2.0,
         norm_stats_path: str = None,  # pi0.5 norm_stats.json
@@ -83,7 +85,7 @@ class Executor(nn.Module):
         If unnormalize=False (loss computation), returns action in normalized space.
         """
         B = imgs.shape[0]
-        img_feat = imgs.reshape(B, -1)  # (B, 4*patch_dim)
+        img_feat = imgs.reshape(B, -1)  # (B, num_imgs*patch_dim)
 
         x = torch.cat([img_feat, current_proprio, subgoal_proprio], dim=-1)
         mean = self.mlp(x)  # (B, action_dim) — normalized space

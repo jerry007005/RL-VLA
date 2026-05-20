@@ -5,6 +5,9 @@ wandb
 
 scripts
 .venv
+.claude
+.vscode
+*.log
 
 logs/
 __pycache__/

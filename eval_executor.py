@@ -39,12 +39,15 @@ NORM_STATS_PATH = os.path.join(
     PI05_CKPT_DIR, "assets", "physical-intelligence", "libero", "norm_stats.json"
 )
 
-PATCH_DIM   = 2048  # SigLIP patch dim AND per-slot SAE latent dim
-PROPRIO_DIM = 8
-ACTION_DIM  = 7
-HIDDEN_DIM  = 512
-NUM_LAYERS  = 5
-MAX_LANG_LEN = 48
+PATCH_DIM      = 2048  # SigLIP patch dim AND per-slot SAE latent dim
+SLOTS_PER_VIEW = 8
+NUM_IMGS       = 4 * SLOTS_PER_VIEW
+LATENT_DIM     = 2 * SLOTS_PER_VIEW * PATCH_DIM   # full SAE latent dim
+PROPRIO_DIM    = 8
+ACTION_DIM     = 7
+HIDDEN_DIM     = 1024
+NUM_LAYERS     = 5
+MAX_LANG_LEN   = 48
 
 EVAL_BATCH  = 32   # batch size for executor forward
 GOAL_BATCH  = 8    # batch size for goal expert (runs PaliGemma, more expensive)
@@ -58,7 +61,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 def load_executor() -> Executor:
     model = Executor(
-        num_imgs=4, patch_dim=PATCH_DIM, proprio_dim=PROPRIO_DIM,
+        num_imgs=NUM_IMGS, patch_dim=PATCH_DIM, proprio_dim=PROPRIO_DIM,
         action_dim=ACTION_DIM, hidden_dim=HIDDEN_DIM, num_hidden_layers=NUM_LAYERS,
         norm_stats_path=NORM_STATS_PATH,
     ).to(DEVICE)
@@ -77,7 +80,8 @@ def load_goal_expert() -> PI0WithGoalExpert:
     train_cfg = _config.get_config("pi05_libero")
     model = PI0WithGoalExpert(
         config=train_cfg.model, patch_dim=PATCH_DIM,
-        proprio_dim=PROPRIO_DIM, freeze_pi0=True,
+        proprio_dim=PROPRIO_DIM, slots_per_view=SLOTS_PER_VIEW,
+        freeze_pi0=True,
         expert_variant="gemma_300m",
         norm_stats_path=NORM_STATS_PATH,
     ).to(DEVICE)
@@ -127,11 +131,11 @@ def load_episodes(feat_cache_dir: str, sg_enc_cache_dir: str,
         feat     = np.load(feat_path / entry["file"])
         enc_data = np.load(enc_path  / enc_index[ep_idx]["file"])
 
-        z         = enc_data["z"].astype(np.float32)          # (N, 4096)
+        z         = enc_data["z"].astype(np.float32)          # (N, 2*S*D)
         ep = {
             "ep_idx":    ep_idx,
             "n_steps":   entry["n_steps"],
-            "z":         z,                                    # (N, 4096)
+            "z":         z,                                    # (N, 2*S*D)
             "states":    enc_data["states"].astype(np.float32),  # (N, 8)
             "actions":   feat["actions"].astype(np.float32),     # (N, 7)
             "sg_frames": enc_data["sg_frames"].astype(np.int32), # (N,)
@@ -159,6 +163,22 @@ def _img_to_chw(imgs_uint8: np.ndarray) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
+# Slot helpers (latent z layout: (N, 2*S*D) → split into per-view slot tensors)
+# ---------------------------------------------------------------------------
+
+def _split_z_slots(z: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
+    """z (N, 2*S*D) → (main_slots, wrist_slots) each (N, S, D) torch tensors."""
+    N = z.shape[0]
+    z_view = z.reshape(N, 2, SLOTS_PER_VIEW, PATCH_DIM)
+    return torch.from_numpy(z_view[:, 0]), torch.from_numpy(z_view[:, 1])
+
+
+def _build_imgs(curr_main, curr_wrist, sg_main, sg_wrist) -> torch.Tensor:
+    """Each input (B, S, D) → executor imgs (B, 4S, D) via concat on slot dim."""
+    return torch.cat([curr_main, curr_wrist, sg_main, sg_wrist], dim=1)
+
+
+# ---------------------------------------------------------------------------
 # Test 1: ground-truth subgoal
 # ---------------------------------------------------------------------------
 
@@ -171,12 +191,11 @@ def eval_gt(executor: Executor, episodes: list) -> dict:
         N = ep["n_steps"]
         sg_idx = ep["sg_frames"]                           # (N,)
 
-        z         = ep["z"]                                # (N, 4096)
-        curr_main  = torch.from_numpy(z[:, :PATCH_DIM])   # (N, 2048)
-        curr_wrist = torch.from_numpy(z[:, PATCH_DIM:])   # (N, 2048)
+        z          = ep["z"]                                # (N, 2*S*D)
+        curr_main, curr_wrist = _split_z_slots(z)          # (N, S, D) each
+        sg_main    = curr_main[sg_idx]                     # (N, S, D)
+        sg_wrist   = curr_wrist[sg_idx]
         curr_state = torch.from_numpy(ep["states"])
-        sg_main    = torch.from_numpy(z[sg_idx, :PATCH_DIM])
-        sg_wrist   = torch.from_numpy(z[sg_idx, PATCH_DIM:])
         sg_state   = torch.from_numpy(ep["states"][sg_idx])
         actions    = torch.from_numpy(ep["actions"])
 
@@ -184,9 +203,9 @@ def eval_gt(executor: Executor, episodes: list) -> dict:
         l1_ep = []
         for i in range(0, N, EVAL_BATCH):
             sl = slice(i, i + EVAL_BATCH)
-            imgs = torch.stack([
+            imgs = _build_imgs(
                 curr_main[sl], curr_wrist[sl], sg_main[sl], sg_wrist[sl]
-            ], dim=1).to(DEVICE)                          # (B, 4, 2048)
+            ).to(DEVICE)                                   # (B, 4S, D)
             pred, _, _ = executor(
                 imgs,
                 curr_state[sl].to(DEVICE),
@@ -222,9 +241,8 @@ def eval_generated(executor: Executor, goal_expert: PI0WithGoalExpert,
             continue
 
         N          = ep["n_steps"]
-        z          = ep["z"]                               # (N, 4096)
-        curr_main  = torch.from_numpy(z[:, :PATCH_DIM])
-        curr_wrist = torch.from_numpy(z[:, PATCH_DIM:])
+        z          = ep["z"]                               # (N, 2*S*D)
+        curr_main, curr_wrist = _split_z_slots(z)         # (N, S, D)
         curr_state = torch.from_numpy(ep["states"])
         actions    = torch.from_numpy(ep["actions"])
 
@@ -237,7 +255,7 @@ def eval_generated(executor: Executor, goal_expert: PI0WithGoalExpert,
             B    = min(GOAL_BATCH, N - i)
             imgs = _img_to_chw(ep["main_imgs"][sl]).to(DEVICE)
             wrist= _img_to_chw(ep["wrist_imgs"][sl]).to(DEVICE)
-            curr_z = torch.from_numpy(z[sl]).to(DEVICE)           # (B, 4096)
+            curr_z = torch.from_numpy(z[sl]).to(DEVICE)           # (B, 2*S*D)
 
             sg_m, sg_w, sg_s, _ = goal_expert.sample_goal(
                 imgs, wrist,
@@ -246,20 +264,20 @@ def eval_generated(executor: Executor, goal_expert: PI0WithGoalExpert,
                 curr_z,
                 curr_state[sl].to(DEVICE),
             )
-            sg_main_list.append(sg_m.cpu())
+            sg_main_list.append(sg_m.cpu())     # (B, S, D)
             sg_wrist_list.append(sg_w.cpu())
             sg_state_list.append(sg_s.cpu())
 
-        sg_main  = torch.cat(sg_main_list,  dim=0)
+        sg_main  = torch.cat(sg_main_list,  dim=0)   # (N, S, D)
         sg_wrist = torch.cat(sg_wrist_list, dim=0)
         sg_state = torch.cat(sg_state_list, dim=0)
 
         l1_ep = []
         for i in range(0, N, EVAL_BATCH):
             sl = slice(i, i + EVAL_BATCH)
-            imgs = torch.stack([
+            imgs = _build_imgs(
                 curr_main[sl], curr_wrist[sl], sg_main[sl], sg_wrist[sl]
-            ], dim=1).to(DEVICE)
+            ).to(DEVICE)
             pred, _, _ = executor(
                 imgs,
                 curr_state[sl].to(DEVICE),
@@ -296,8 +314,7 @@ def eval_gen_img_gt_state(executor: Executor, goal_expert: PI0WithGoalExpert,
 
         N          = ep["n_steps"]
         z          = ep["z"]
-        curr_main  = torch.from_numpy(z[:, :PATCH_DIM])
-        curr_wrist = torch.from_numpy(z[:, PATCH_DIM:])
+        curr_main, curr_wrist = _split_z_slots(z)
         curr_state = torch.from_numpy(ep["states"])
         actions    = torch.from_numpy(ep["actions"])
         sg_frames  = ep["sg_frames"]
@@ -328,9 +345,9 @@ def eval_gen_img_gt_state(executor: Executor, goal_expert: PI0WithGoalExpert,
         l1_ep = []
         for i in range(0, N, EVAL_BATCH):
             sl = slice(i, i + EVAL_BATCH)
-            imgs = torch.stack([
+            imgs = _build_imgs(
                 curr_main[sl], curr_wrist[sl], sg_main[sl], sg_wrist[sl]
-            ], dim=1).to(DEVICE)
+            ).to(DEVICE)
             pred, _, _ = executor(
                 imgs, curr_state[sl].to(DEVICE), sg_state[sl].to(DEVICE),
                 deterministic=True,
@@ -362,13 +379,12 @@ def eval_gt_img_gen_state(executor: Executor, goal_expert: PI0WithGoalExpert,
 
         N         = ep["n_steps"]
         z         = ep["z"]
-        curr_main  = torch.from_numpy(z[:, :PATCH_DIM])
-        curr_wrist = torch.from_numpy(z[:, PATCH_DIM:])
+        curr_main, curr_wrist = _split_z_slots(z)
         curr_state = torch.from_numpy(ep["states"])
         actions    = torch.from_numpy(ep["actions"])
         sg_frames  = ep["sg_frames"]
-        sg_main    = torch.from_numpy(z[sg_frames, :PATCH_DIM])  # GT img
-        sg_wrist   = torch.from_numpy(z[sg_frames, PATCH_DIM:])  # GT img
+        sg_main    = curr_main[sg_frames]                       # (N, S, D) GT img slots
+        sg_wrist   = curr_wrist[sg_frames]
 
         lang_tok  = ep["lang_tokens"].unsqueeze(0)
         lang_mask = ep["lang_mask"].unsqueeze(0)
@@ -393,9 +409,9 @@ def eval_gt_img_gen_state(executor: Executor, goal_expert: PI0WithGoalExpert,
         l1_ep = []
         for i in range(0, N, EVAL_BATCH):
             sl = slice(i, i + EVAL_BATCH)
-            imgs = torch.stack([
+            imgs = _build_imgs(
                 curr_main[sl], curr_wrist[sl], sg_main[sl], sg_wrist[sl]
-            ], dim=1).to(DEVICE)
+            ).to(DEVICE)
             pred, _, _ = executor(
                 imgs, curr_state[sl].to(DEVICE), sg_state[sl].to(DEVICE),
                 deterministic=True,
@@ -423,22 +439,21 @@ def eval_black(executor: Executor, episodes: list) -> dict:
     for ep in tqdm(episodes, desc="Test 5 (black subgoal)"):
         N = ep["n_steps"]
 
-        z          = ep["z"]                                # (N, 4096)
-        curr_main  = torch.from_numpy(z[:, :PATCH_DIM])
-        curr_wrist = torch.from_numpy(z[:, PATCH_DIM:])
+        z          = ep["z"]                                # (N, 2*S*D)
+        curr_main, curr_wrist = _split_z_slots(z)
         curr_state = torch.from_numpy(ep["states"])
         actions    = torch.from_numpy(ep["actions"])
 
-        sg_main  = torch.zeros(N, PATCH_DIM)
-        sg_wrist = torch.zeros(N, PATCH_DIM)
+        sg_main  = torch.zeros(N, SLOTS_PER_VIEW, PATCH_DIM)
+        sg_wrist = torch.zeros(N, SLOTS_PER_VIEW, PATCH_DIM)
         sg_state = torch.zeros(N, PROPRIO_DIM)
 
         l1_ep = []
         for i in range(0, N, EVAL_BATCH):
             sl = slice(i, i + EVAL_BATCH)
-            imgs = torch.stack([
+            imgs = _build_imgs(
                 curr_main[sl], curr_wrist[sl], sg_main[sl], sg_wrist[sl]
-            ], dim=1).to(DEVICE)
+            ).to(DEVICE)
             pred, _, _ = executor(
                 imgs,
                 curr_state[sl].to(DEVICE),

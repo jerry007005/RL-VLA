@@ -20,6 +20,14 @@ import torch
 import tqdm
 import draccus
 
+# LIBERO's benchmark.get_task_init_states calls torch.load() without weights_only;
+# upstream LIBERO has not patched this. Default it here so torch>=2.6 doesn't error.
+_orig_torch_load = torch.load
+def _torch_load_compat(*args, **kwargs):
+    kwargs.setdefault("weights_only", False)
+    return _orig_torch_load(*args, **kwargs)
+torch.load = _torch_load_compat
+
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 sys.path.insert(0, str(pathlib.Path(__file__).parent / "openpi" / "src"))
 
@@ -34,11 +42,13 @@ from model.subgoal_encoder     import SubgoalAutoencoder
 LIBERO_DUMMY_ACTION    = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION  = 256
 
-PATCH_DIM   = 2048
-PROPRIO_DIM = 8
-ACTION_DIM  = 7
-HIDDEN_DIM  = 512
-NUM_LAYERS  = 5
+PATCH_DIM      = 2048
+SLOTS_PER_VIEW = 8
+NUM_IMGS       = 4 * SLOTS_PER_VIEW
+PROPRIO_DIM    = 8
+ACTION_DIM     = 7
+HIDDEN_DIM     = 1024
+NUM_LAYERS     = 5
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -74,7 +84,7 @@ class Args:
 
 def _load_executor(ckpt_path: str, norm_stats_path: str) -> Executor:
     model = Executor(
-        num_imgs=4, patch_dim=PATCH_DIM, proprio_dim=PROPRIO_DIM,
+        num_imgs=NUM_IMGS, patch_dim=PATCH_DIM, proprio_dim=PROPRIO_DIM,
         action_dim=ACTION_DIM, hidden_dim=HIDDEN_DIM, num_hidden_layers=NUM_LAYERS,
         norm_stats_path=norm_stats_path,
     ).to(DEVICE)
@@ -95,7 +105,8 @@ def _load_goal_expert(goal_ckpt: str, pi05_ckpt_dir: str) -> PI0WithGoalExpert:
     )
     model = PI0WithGoalExpert(
         config=train_cfg.model, patch_dim=PATCH_DIM,
-        proprio_dim=PROPRIO_DIM, freeze_pi0=True,
+        proprio_dim=PROPRIO_DIM, slots_per_view=SLOTS_PER_VIEW,
+        freeze_pi0=True,
         expert_variant="gemma_300m",
         norm_stats_path=ns_path,
     ).to(DEVICE)
@@ -137,7 +148,7 @@ def _get_state(obs: dict) -> torch.Tensor:
 
 def _load_subgoal_encoder(ckpt_path: str) -> SubgoalAutoencoder:
     ae = SubgoalAutoencoder(
-        patch_dim=PATCH_DIM, n_queries=2, n_patches=512,
+        patch_dim=PATCH_DIM, slots_per_view=SLOTS_PER_VIEW, n_patches=512,
         n_heads=16, enc_layers=2, dec_layers=2, ffn_mult=4,
     )
     ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
@@ -155,16 +166,19 @@ def _encode_obs(
     subgoal_enc: SubgoalAutoencoder,
     main_t:  torch.Tensor,   # (1, 3, H, W)
     wrist_t: torch.Tensor,   # (1, 3, H, W)
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Returns (curr_main, curr_wrist) each (1, 2048) as SubgoalAutoencoder latents —
-    the same representation the executor and goal expert were trained on.
+    Returns (curr_main, curr_wrist, curr_z):
+      curr_main : (1, S, PATCH_DIM)   main slots
+      curr_wrist: (1, S, PATCH_DIM)   wrist slots
+      curr_z    : (1, 2*S*PATCH_DIM)  flat latent (matches SAE encode output)
     """
-    main_patches  = goal_expert.paligemma_with_expert.embed_image(main_t).float()   # (1, 256, 2048)
-    wrist_patches = goal_expert.paligemma_with_expert.embed_image(wrist_t).float()  # (1, 256, 2048)
+    main_patches  = goal_expert.paligemma_with_expert.embed_image(main_t).float()
+    wrist_patches = goal_expert.paligemma_with_expert.embed_image(wrist_t).float()
     patches = torch.cat([main_patches, wrist_patches], dim=1)                       # (1, 512, 2048)
-    z = subgoal_enc.encode(patches)                                                  # (1, 4096)
-    return z[:, :PATCH_DIM], z[:, PATCH_DIM:]                                       # (1,2048), (1,2048)
+    z       = subgoal_enc.encode(patches)                                            # (1, 2*S*D)
+    curr_main, curr_wrist = subgoal_enc.split_z(z)                                   # each (1, S, D)
+    return curr_main, curr_wrist, z
 
 
 def _make_tokenizer(max_len: int):
@@ -297,10 +311,9 @@ def eval_libero(args: Args) -> None:
                     curr_main = curr_wrist = curr_z = None
                     if need_encoder:
                         with torch.no_grad():
-                            curr_main, curr_wrist = _encode_obs(
+                            curr_main, curr_wrist, curr_z = _encode_obs(
                                 goal_expert, subgoal_enc, main_t, wrist_t
-                            )  # each (1, 2048) SAE latent
-                            curr_z = torch.cat([curr_main, curr_wrist], dim=-1)  # (1, 4096)
+                            )  # curr_main/wrist: (1, S, D); curr_z: (1, 2*S*D)
 
                     # Replan if needed
                     if step_since_replan >= next_replan_in:
@@ -336,9 +349,10 @@ def eval_libero(args: Args) -> None:
                         action  = vla_actions[:, step_since_replan]
                     else:
                         # sample_goal, or sample_all after chunk exhausted → executor
-                        imgs = torch.stack(
+                        # curr_main/wrist: (1, S, D); sg_main/wrist: (1, S, D) from goal expert
+                        imgs = torch.cat(
                             [curr_main, curr_wrist, sg_main, sg_wrist], dim=1
-                        )  # (1, 4, 2048)
+                        )  # (1, 4S, D)
                         with torch.no_grad():
                             action, _, _ = executor(
                                 imgs, state_t, sg_state, deterministic=True

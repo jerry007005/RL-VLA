@@ -52,6 +52,7 @@ CKPT_DIR          = "./checkpoints/subgoal_encoder"
 IMG_SIZE   = 224
 PATCH_DIM  = 2048
 N_PATCHES  = 512   # 256 main + 256 wrist
+SLOTS_PER_VIEW = 8
 
 BATCH_SIZE   = 16  # reduced from 32 because each sample is now T frames
 LR           = 3e-4
@@ -251,12 +252,13 @@ def train():
             project = WANDB_PROJECT,
             name    = WANDB_RUN_NAME,
             config  = {
-                "batch_size":  BATCH_SIZE,
-                "lr":          LR,
-                "max_steps":   MAX_STEPS,
-                "patch_dim":   PATCH_DIM,
-                "n_patches":   N_PATCHES,
-                "world_size":  world_size,
+                "batch_size":     BATCH_SIZE,
+                "lr":             LR,
+                "max_steps":      MAX_STEPS,
+                "patch_dim":      PATCH_DIM,
+                "n_patches":      N_PATCHES,
+                "slots_per_view": SLOTS_PER_VIEW,
+                "world_size":     world_size,
             },
             resume="allow",
         )
@@ -274,7 +276,7 @@ def train():
     # ---- autoencoder (trainable) ----
     ae = SubgoalAutoencoder(
         patch_dim        = PATCH_DIM,
-        n_queries        = 2,
+        slots_per_view   = SLOTS_PER_VIEW,
         n_patches        = N_PATCHES,
         n_heads          = 16,
         enc_layers       = 2,

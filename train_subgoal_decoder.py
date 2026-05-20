@@ -51,8 +51,10 @@ ENCODER_CKPT_PATH = "./checkpoints/subgoal_encoder/checkpoint.pt"
 IMG_SIZE     = 224
 MAX_LANG_LEN = 48
 
-PATCH_DIM   = 2048
-PROPRIO_DIM = 8
+PATCH_DIM      = 2048
+PROPRIO_DIM    = 8
+SLOTS_PER_VIEW = 8
+LATENT_DIM     = 2 * SLOTS_PER_VIEW * PATCH_DIM   # 32768
 
 BATCH_SIZE    = 64
 LR            = 3e-4
@@ -98,7 +100,7 @@ TEMPORAL_WINDOW = 5  # must match the temporal_window used to train SubgoalAutoe
 def _load_subgoal_encoder_for_phase05():
     from model.subgoal_encoder import SubgoalAutoencoder
     ae = SubgoalAutoencoder(
-        patch_dim=PATCH_DIM, n_queries=2, n_patches=512,
+        patch_dim=PATCH_DIM, slots_per_view=SLOTS_PER_VIEW, n_patches=512,
         n_heads=16, enc_layers=2, dec_layers=2, ffn_mult=4,
         temporal_window=TEMPORAL_WINDOW, temporal_layers=2,
     )
@@ -115,8 +117,9 @@ def _load_subgoal_encoder_for_phase05():
 def _encode_frames(backbone, encoder, main_imgs_uint8, wrist_imgs_uint8,
                    bs_backbone=16, bs_window=4):
     """
-    (N, H, W, 3) uint8 arrays → z (N, 4096) float32.
-    Each frame is encoded with a ±T//2 temporal window (edge-clamped).
+    (N, H, W, 3) uint8 arrays → z (N, LATENT_DIM) float32.
+    For 8-slot SAE: LATENT_DIM = 32768. Each frame is encoded with a ±T//2
+    temporal window (edge-clamped).
     """
     from openpi_client import image_tools
 
@@ -153,7 +156,7 @@ def _encode_frames(backbone, encoder, main_imgs_uint8, wrist_imgs_uint8,
         )                                                                     # (cur, T)
         windows = all_patches[idxs].to(DEVICE)                                # (cur, T, 512, 2048)
         z_list.append(encoder.encode(windows).cpu().numpy())
-    return np.concatenate(z_list, axis=0).astype(np.float32)                  # (N, 4096)
+    return np.concatenate(z_list, axis=0).astype(np.float32)                  # (N, LATENT_DIM)
 
 
 def extract_sg_encoder_latents():
@@ -283,20 +286,19 @@ def _img_to_chw(img_uint8: np.ndarray) -> torch.Tensor:
 
 class GoalExpertDataset(IterableDataset):
     """
-    Each item:
+    Each item (S = SLOTS_PER_VIEW):
       main_chw    : (3, 224, 224) float32   current main image
       wrist_chw   : (3, 224, 224) float32   current wrist image
       lang_tokens : (MAX_LANG_LEN,) int64
       lang_mask   : (MAX_LANG_LEN,) bool
-      curr_main   : (PATCH_DIM,)   float32  encoder latent z[curr, :2048]
-      curr_wrist  : (PATCH_DIM,)   float32  encoder latent z[curr, 2048:]
-      sg_main     : (PATCH_DIM,)   float32  encoder latent z[sg, :2048]
-      sg_wrist    : (PATCH_DIM,)   float32  encoder latent z[sg, 2048:]
-      sg_state    : (PROPRIO_DIM,) float32  robot state at subgoal frame
+      curr_main   : (S, PATCH_DIM)  float32  encoder latent main slots @ curr frame
+      curr_wrist  : (S, PATCH_DIM)  float32  encoder latent wrist slots @ curr frame
+      sg_main     : (S, PATCH_DIM)  float32  encoder latent main slots @ sg frame
+      sg_wrist    : (S, PATCH_DIM)  float32  encoder latent wrist slots @ sg frame
+      sg_state    : (PROPRIO_DIM,)  float32  robot state at subgoal frame
 
-    Reads raw images + lang from subgoal_cache_dir.
-    Reads encoder latents + states + sg_frames from sg_enc_cache_dir
-    (built by extract_sg_encoder_latents()).
+    Latent layout in cache:  z (N, 2*S*PATCH_DIM) → reshape to (N, 2, S, PATCH_DIM):
+      z[:, 0] = main slots,  z[:, 1] = wrist slots.
     """
 
     def __init__(self, subgoal_cache_dir: str, sg_enc_cache_dir: str):
@@ -320,13 +322,19 @@ class GoalExpertDataset(IterableDataset):
             enc_data = np.load(enc_path / entry["file"])
             sg_data  = np.load(sg_path  / sg_entry["file"])
 
+            # z layout: (N, 2*S*PATCH_DIM); reshape to (N, 2, S, PATCH_DIM)
+            z_flat = enc_data["z"].astype(np.float32)                 # (N, 2*S*PATCH_DIM)
+            N      = z_flat.shape[0]
+            z_view = z_flat.reshape(N, 2, SLOTS_PER_VIEW, PATCH_DIM)  # (N, 2, S, D)
+
             self.episodes.append({
                 "ep_idx":      ep_idx,
                 "n_steps":     entry["n_steps"],
                 "sg_file":     str(sg_path / sg_entry["file"]),
-                "z":           enc_data["z"].astype(np.float32),        # (N, 4096)
-                "states":      enc_data["states"].astype(np.float32),   # (N, 8)
-                "sg_frames":   enc_data["sg_frames"].astype(np.int32),  # (N,)
+                "z_main":      z_view[:, 0],                             # (N, S, D)
+                "z_wrist":     z_view[:, 1],                             # (N, S, D)
+                "states":      enc_data["states"].astype(np.float32),    # (N, 8)
+                "sg_frames":   enc_data["sg_frames"].astype(np.int32),   # (N,)
                 "lang_tokens": torch.from_numpy(sg_data["lang_tokens"].astype(np.int64)),
                 "lang_mask":   torch.from_numpy(sg_data["lang_mask"].astype(bool)),
             })
@@ -349,20 +357,18 @@ class GoalExpertDataset(IterableDataset):
 
             for step_idx in step_order:
                 sg_idx  = int(ep["sg_frames"][step_idx])
-                z_curr  = ep["z"][step_idx]        # (4096,) = 2 slots × 2048
-                z_sg    = ep["z"][sg_idx]
                 yield (
-                    _img_to_chw(main_imgs[step_idx]),                   # (3, H, W)
-                    _img_to_chw(wrist_imgs[step_idx]),                  # (3, H, W)
-                    ep["lang_tokens"],                                   # (T,)
-                    ep["lang_mask"],                                     # (T,)
-                    torch.from_numpy(z_curr[:PATCH_DIM].copy()),        # (2048,) curr_main
-                    torch.from_numpy(z_curr[PATCH_DIM:].copy()),        # (2048,) curr_wrist
-                    torch.from_numpy(ep["states"][step_idx].copy()),    # (8,)    curr_state
-                    torch.from_numpy(z_sg[:PATCH_DIM].copy()),          # (2048,) sg_main
-                    torch.from_numpy(z_sg[PATCH_DIM:].copy()),          # (2048,) sg_wrist
-                    torch.from_numpy(ep["states"][sg_idx].copy()),      # (8,)    sg_state
-                    torch.tensor(sg_idx - step_idx, dtype=torch.float32),  # ()  horizon
+                    _img_to_chw(main_imgs[step_idx]),                      # (3, H, W)
+                    _img_to_chw(wrist_imgs[step_idx]),                     # (3, H, W)
+                    ep["lang_tokens"],                                      # (T,)
+                    ep["lang_mask"],                                        # (T,)
+                    torch.from_numpy(ep["z_main"][step_idx].copy()),       # (S, D) curr_main
+                    torch.from_numpy(ep["z_wrist"][step_idx].copy()),      # (S, D) curr_wrist
+                    torch.from_numpy(ep["states"][step_idx].copy()),       # (8,)   curr_state
+                    torch.from_numpy(ep["z_main"][sg_idx].copy()),         # (S, D) sg_main
+                    torch.from_numpy(ep["z_wrist"][sg_idx].copy()),        # (S, D) sg_wrist
+                    torch.from_numpy(ep["states"][sg_idx].copy()),         # (8,)   sg_state
+                    torch.tensor(sg_idx - step_idx, dtype=torch.float32),  # ()     horizon
                 )
 
 
@@ -380,8 +386,9 @@ def _load_model() -> PI0WithGoalExpert:
         config          = train_cfg.model,
         patch_dim       = PATCH_DIM,
         proprio_dim     = PROPRIO_DIM,
+        slots_per_view  = SLOTS_PER_VIEW,
         freeze_pi0      = True,
-        expert_variant  = "gemma_300m",
+        expert_variant="gemma_300m",
         norm_stats_path = NORM_STATS_PATH,
     )
     # Load PI0 base weights (frozen backbone)
@@ -434,6 +441,7 @@ def train():
                 "img_size":        IMG_SIZE,
                 "patch_dim":       PATCH_DIM,
                 "proprio_dim":     PROPRIO_DIM,
+                "slots_per_view":  SLOTS_PER_VIEW,
             },
             resume="allow",
         )

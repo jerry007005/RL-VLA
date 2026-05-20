@@ -43,10 +43,12 @@ NORM_STATS_PATH = os.path.join(
 IMG_SIZE      = 224
 PATCH_DIM     = 2048   # SigLIP patch dim (SAE input) AND per-slot SAE latent dim (output)
 N_PATCHES     = 512    # 256 main + 256 wrist
+SLOTS_PER_VIEW = 8     # SAE multi-slot config
+NUM_IMGS       = 4 * SLOTS_PER_VIEW   # curr_main(S) + curr_wrist(S) + sg_main(S) + sg_wrist(S)
 
 PROPRIO_DIM   = 8
 ACTION_DIM    = 7
-HIDDEN_DIM    = 512
+HIDDEN_DIM    = 1024
 NUM_LAYERS    = 5
 
 BATCH_SIZE          = 64
@@ -99,7 +101,7 @@ def _load_pi05_vision_encoder():
 def _load_subgoal_encoder() -> SubgoalAutoencoder:
     """Load frozen SubgoalAutoencoder from Phase-A checkpoint."""
     ae = SubgoalAutoencoder(
-        patch_dim=PATCH_DIM, n_queries=2, n_patches=N_PATCHES,
+        patch_dim=PATCH_DIM, slots_per_view=SLOTS_PER_VIEW, n_patches=N_PATCHES,
         n_heads=16, enc_layers=2, dec_layers=2, ffn_mult=4,
     )
     ckpt = torch.load(ENCODER_CKPT_PATH, map_location=DEVICE, weights_only=False)
@@ -178,7 +180,7 @@ def extract_features():
     Extract and cache SubgoalAutoencoder latents for every frame of every episode.
 
     Cache format per episode npz:
-      z         : (N, 4096)  encoder latent for each frame (main+wrist)
+      z         : (N, 2*S*PATCH_DIM)  encoder latent (main+wrist slots flat)
       states    : (N, 8)
       actions   : (N, 7)
       sg_frames : (N,)       index of subgoal frame for each step
@@ -248,35 +250,41 @@ def extract_features():
 class ExecutorDataset(IterableDataset):
     """
     Infinite iterable dataset with shuffle buffer.
-    Each item: (imgs (4, 2048), curr_state (8,), sg_state (8,), action (7,))
-    imgs layout: [curr_main, curr_wrist, sg_main, sg_wrist]
-      where each slot is a 2048-dim encoder latent token from SubgoalAutoencoder.
+    Each item: (imgs (4*S, PATCH_DIM), curr_state (8,), sg_state (8,), action (7,))
+    imgs layout (S = SLOTS_PER_VIEW):
+      [0..S-1]      curr_main slots
+      [S..2S-1]     curr_wrist slots
+      [2S..3S-1]    sg_main slots
+      [3S..4S-1]    sg_wrist slots
     """
 
     def __init__(self, cache_dir: str, shuffle_buffer_size: int = 1_000):
         self.samples = []
         self.shuffle_buffer_size = shuffle_buffer_size
+        S = SLOTS_PER_VIEW
 
         index = json.loads((Path(cache_dir) / "index.json").read_text())
         print("Loading feature cache ...")
         for entry in index:
             data = np.load(Path(cache_dir) / entry["file"])
+            z_flat = data["z"].astype(np.float32)                    # (N, 2*S*PATCH_DIM)
+            N      = z_flat.shape[0]
+            z_view = z_flat.reshape(N, 2, S, PATCH_DIM)              # (N, 2, S, PATCH_DIM)
             ep = {
-                "z":         data["z"].astype(np.float32),        # (N, 4096)
+                "z_main":    z_view[:, 0],                            # (N, S, PATCH_DIM)
+                "z_wrist":   z_view[:, 1],
                 "states":    data["states"].astype(np.float32),
                 "actions":   data["actions"].astype(np.float32),
                 "sg_frames": data["sg_frames"].astype(np.int32),
             }
             for step_idx in range(entry["n_steps"]):
-                sg_idx   = int(ep["sg_frames"][step_idx])
-                z_curr   = ep["z"][step_idx]   # (4096,) = 2 slots × 2048
-                z_sg     = ep["z"][sg_idx]
-                imgs = np.stack([
-                    z_curr[:PATCH_DIM],   # curr_main
-                    z_curr[PATCH_DIM:],   # curr_wrist
-                    z_sg[:PATCH_DIM],     # sg_main
-                    z_sg[PATCH_DIM:],     # sg_wrist
-                ], axis=0)               # (4, 2048)
+                sg_idx = int(ep["sg_frames"][step_idx])
+                imgs = np.concatenate([
+                    ep["z_main"][step_idx],      # (S, D) curr_main
+                    ep["z_wrist"][step_idx],     # (S, D) curr_wrist
+                    ep["z_main"][sg_idx],        # (S, D) sg_main
+                    ep["z_wrist"][sg_idx],       # (S, D) sg_wrist
+                ], axis=0)                       # (4S, D)
                 self.samples.append((
                     torch.from_numpy(imgs),
                     torch.from_numpy(ep["states"][step_idx]),
@@ -310,16 +318,18 @@ def train():
         project=WANDB_PROJECT,
         name=WANDB_RUN_NAME,
         config={
-            "dataset":      DATASET_NAME,
-            "batch_size":   BATCH_SIZE,
-            "lr":           LR,
-            "weight_decay": WEIGHT_DECAY,
-            "max_steps":    MAX_STEPS,
-            "hidden_dim":   HIDDEN_DIM,
-            "num_layers":   NUM_LAYERS,
-            "patch_dim":    PATCH_DIM,
-            "proprio_dim":  PROPRIO_DIM,
-            "action_dim":   ACTION_DIM,
+            "dataset":        DATASET_NAME,
+            "batch_size":     BATCH_SIZE,
+            "lr":             LR,
+            "weight_decay":   WEIGHT_DECAY,
+            "max_steps":      MAX_STEPS,
+            "hidden_dim":     HIDDEN_DIM,
+            "num_layers":     NUM_LAYERS,
+            "patch_dim":      PATCH_DIM,
+            "proprio_dim":    PROPRIO_DIM,
+            "action_dim":     ACTION_DIM,
+            "slots_per_view": SLOTS_PER_VIEW,
+            "num_imgs":       NUM_IMGS,
         },
         resume="allow",
     )
@@ -333,7 +343,7 @@ def train():
     )
 
     model = Executor(
-        num_imgs          = 4,            # curr_main, curr_wrist, sg_main, sg_wrist
+        num_imgs          = NUM_IMGS,     # 4 * SLOTS_PER_VIEW
         patch_dim         = PATCH_DIM,    # 2048
         proprio_dim       = PROPRIO_DIM,
         action_dim        = ACTION_DIM,
@@ -370,11 +380,14 @@ def train():
         sg_state   = sg_state.to(DEVICE)
         actions    = actions.to(DEVICE)
 
-        # imgs shape: (B, 4, PATCH_DIM) — [curr_main, curr_wrist, sg_main, sg_wrist]
+        # imgs shape: (B, 4S, PATCH_DIM)
+        #   [0..2S-1]   curr slots (main+wrist)
+        #   [2S..4S-1]  sg slots   (main+wrist)
+        _split = 2 * SLOTS_PER_VIEW
         if CURR_NOISE_STD > 0:
-            imgs[:, :2] = imgs[:, :2] + torch.randn_like(imgs[:, :2]) * CURR_NOISE_STD
+            imgs[:, :_split] = imgs[:, :_split] + torch.randn_like(imgs[:, :_split]) * CURR_NOISE_STD
         if SG_NOISE_STD > 0:
-            imgs[:, 2:] = imgs[:, 2:] + torch.randn_like(imgs[:, 2:]) * SG_NOISE_STD
+            imgs[:, _split:] = imgs[:, _split:] + torch.randn_like(imgs[:, _split:]) * SG_NOISE_STD
         if STATE_NOISE_STD > 0:
             curr_state = curr_state + torch.randn_like(curr_state) * STATE_NOISE_STD
             sg_state   = sg_state   + torch.randn_like(sg_state)   * STATE_NOISE_STD
